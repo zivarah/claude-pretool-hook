@@ -1,0 +1,1082 @@
+{
+  "tools": {
+    "Bash": {
+      "commands": {
+        "ls": "allow",
+        "cat": "allow",
+        "grep": "allow",
+        "echo": "allow",
+        "wc": "allow",
+        "head": "allow",
+        "sort": {
+          "decision": "allow",
+          "options": {
+            "-o": {
+              "decision": "allow",
+              "aliases": ["--output"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "jq": {
+          "decision": "allow",
+          "options": {
+            "-f": {
+              "decision": "allow",
+              "aliases": ["--from-file"],
+              "values": {
+                "*": { "if": "readable", "then": "allow", "else": "deny" }
+              }
+            },
+            "--slurpfile": {
+              "decision": "allow",
+              "values": {
+                "*": { "if": "readable", "then": "allow", "else": "deny" }
+              }
+            },
+            "--rawfile": {
+              "decision": "allow",
+              "values": {
+                "*": { "if": "readable", "then": "allow", "else": "deny" }
+              }
+            }
+          }
+        },
+
+        "awk": {
+          "decision": "allow",
+          "options": {
+            "-f": {
+              "decision": "allow",
+              "values": {
+                "*": { "if": "readable", "then": "allow", "else": "deny" }
+              }
+            }
+          }
+        },
+
+        "find": {
+          "decision": "allow",
+          "flags": {
+            "*": "allow",
+            "-delete": "deny",
+            "-exec": "deny",
+            "-execdir": "deny",
+            "-ok": "deny",
+            "-okdir": "deny"
+          },
+          "options": {
+            "-fprint": {
+              "decision": "allow",
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            },
+            "-fprint0": {
+              "decision": "allow",
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            },
+            "-fprintf": {
+              "decision": "allow",
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            },
+            "-fls": {
+              "decision": "allow",
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "shfmt": {
+          "decision": "allow",
+          "flags": {
+            "-w": {
+              "aliases": ["--write"],
+              "positional": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            },
+            "-l": { "decision": "allow", "aliases": ["--list"] },
+            "-d": { "decision": "allow", "aliases": ["--diff"] },
+            "-f": { "decision": "allow", "aliases": ["--find"] },
+            "-mn": "allow",
+            "-s": { "decision": "allow", "aliases": ["--simplify"] },
+            "-tojson": "allow"
+          },
+          "positional": {
+            "*": { "if": "readable", "then": "allow", "else": "deny" }
+          }
+        },
+
+        "dd": "deny",
+        "eval": "deny",
+        "exec": "deny",
+        "mkfs": "deny",
+
+        "sh": {
+          "decision": "ask",
+          "flags": {
+            "-c": "deny"
+          }
+        },
+
+        "sed": {
+          "decision": "allow",
+          "flags": {
+            "-i": {
+              "decision": "ask",
+              "aliases": ["--in-place"]
+            },
+            "-n": {
+              "decision": "allow",
+              "aliases": ["--quiet", "--silent"]
+            },
+            "-r": {
+              "decision": "allow",
+              "aliases": ["-E", "--regexp-extended"]
+            },
+            "-z": {
+              "decision": "allow",
+              "aliases": ["--null-data"]
+            }
+          },
+          "options": {
+            "-e": {
+              "decision": "allow",
+              "aliases": ["--expression"],
+              "values": {
+                "*": "allow"
+              }
+            },
+            "-f": {
+              "decision": "allow",
+              "aliases": ["--file"],
+              "values": {
+                "*": {
+                  "if": "readable",
+                  "then": "allow",
+                  "else": "deny"
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": "allow",
+            "1": [
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "mkdir": {
+          "decision": "ask",
+          "flags": {
+            "-p": {
+              "decision": "allow",
+              "aliases": ["--parents"]
+            }
+          },
+          "positional": {
+            "*": "ask",
+            "1": [
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "rm": {
+          "decision": "allow",
+          "flags": {
+            "--recursive": "deny",
+            "-r": "deny",
+            "-rf": "deny",
+            "-fr": "deny"
+          },
+          "positional": {
+            "*": "ask",
+            "1": [
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "rmdir": {
+          "decision": "ask",
+          "positional": {
+            "*": "ask",
+            "1": [
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "command": {
+          "decision": "ask",
+          "isWrapper": true,
+          "flags": {
+            "-v": {
+              "decision": "allow",
+              "force": true
+            },
+            "-V": {
+              "decision": "allow",
+              "force": true
+            },
+            "-p": "allow"
+          }
+        },
+
+        "timeout": {
+          "decision": "ask",
+          "isWrapper": true,
+          "skipPositional": 1,
+          "flags": {
+            "--foreground": "allow",
+            "--preserve-status": "allow"
+          },
+          "options": {
+            "-k": {
+              "decision": "allow",
+              "aliases": ["--kill-after"]
+            },
+            "-s": {
+              "decision": "allow",
+              "aliases": ["--signal"]
+            }
+          }
+        },
+
+        "xargs": {
+          "decision": "ask",
+          "isWrapper": true,
+          "flags": {
+            "-0": {
+              "decision": "allow",
+              "aliases": ["--null"]
+            },
+            "-r": {
+              "decision": "allow",
+              "aliases": ["--no-run-if-empty"]
+            },
+            "-t": {
+              "decision": "allow",
+              "aliases": ["--verbose"]
+            }
+          },
+          "options": {
+            "-I": {
+              "decision": "allow",
+              "aliases": ["--replace"]
+            },
+            "-n": {
+              "decision": "allow",
+              "aliases": ["--max-args"]
+            },
+            "-P": {
+              "decision": "allow",
+              "aliases": ["--max-procs"]
+            }
+          }
+        },
+
+        "git": {
+          "decision": "ask",
+          "options": {
+            "-C": {
+              "if": "writable",
+              "then": "allow",
+              "else": {
+                "if": "readable",
+                "then": "ask",
+                "else": "deny"
+              }
+            },
+            "-c": "ask"
+          },
+          "subcmds": {
+            "status": "allow",
+            "add": "allow",
+            "blame": "allow",
+            "stash": "allow",
+            "config": {
+              "decision": "ask",
+              "subcmds": {
+                "get": "allow",
+                "list": "allow"
+              }
+            },
+            "diff": {
+              "decision": "allow",
+              "options": {
+                "--output": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "log": {
+              "decision": "allow",
+              "options": {
+                "--output": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "show": {
+              "decision": "allow",
+              "options": {
+                "--output": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "commit": {
+              "decision": "allow",
+              "options": {
+                "-m": {
+                  "decision": "allow",
+                  "allowExpansions": true
+                }
+              }
+            },
+            "clean": "deny",
+            "push": "deny",
+            "reset": "deny"
+          }
+        },
+
+        "cargo": {
+          "decision": "ask",
+          "subcmds": {
+            "build": {
+              "decision": "allow",
+              "options": {
+                "--target-dir": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "check": {
+              "decision": "allow",
+              "options": {
+                "--target-dir": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "clippy": {
+              "decision": "allow",
+              "options": {
+                "--target-dir": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "fmt": "allow",
+            "run": {
+              "decision": "allow",
+              "options": {
+                "--target-dir": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "test": {
+              "decision": "allow",
+              "options": {
+                "--target-dir": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "dotnet": {
+          "decision": "ask",
+          "flags": {
+            "--list-sdks": "allow",
+            "--list-runtimes": "allow"
+          },
+          "subcmds": {
+            "build": {
+              "decision": "allow",
+              "options": {
+                "-o": {
+                  "decision": "allow",
+                  "aliases": ["--output"],
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                },
+                "--artifacts-path": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "format": "allow",
+            "list": "allow",
+            "restore": {
+              "decision": "allow",
+              "options": {
+                "--packages": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "run": {
+              "decision": "allow",
+              "options": {
+                "--artifacts-path": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "test": {
+              "decision": "allow",
+              "options": {
+                "-o": {
+                  "decision": "allow",
+                  "aliases": ["--output"],
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                },
+                "--results-directory": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "nix": {
+          "decision": "ask",
+          "subcmds": {
+            "eval": {
+              "decision": "allow",
+              "options": {
+                "--write-to": {
+                  "decision": "allow",
+                  "values": {
+                    "*": {
+                      "if": "writable",
+                      "then": "allow",
+                      "else": {
+                        "if": "readable",
+                        "then": "ask",
+                        "else": "deny"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "fmt": "allow",
+            "log": "allow",
+            "flake": {
+              "decision": "ask",
+              "subcmds": {
+                "check": "allow",
+                "show": "allow"
+              }
+            }
+          }
+        },
+
+        "cd": {
+          "decision": "ask",
+          "positional": {
+            "1": [
+              {
+                "if": "readable",
+                "then": "allow",
+                "else": "deny"
+              }
+            ]
+          }
+        },
+
+        "cp": {
+          "decision": "ask",
+          "flags": {
+            "-r": {
+              "decision": "allow",
+              "aliases": ["-R", "--recursive"]
+            }
+          },
+          "options": {
+            "-t": {
+              "decision": "allow",
+              "aliases": ["--target-directory"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": "ask",
+            "2": [
+              {
+                "if": "readable",
+                "then": "allow",
+                "else": "deny"
+              },
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "mv": {
+          "decision": "ask",
+          "options": {
+            "-t": {
+              "decision": "allow",
+              "aliases": ["--target-directory"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": "ask",
+            "2": [
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              },
+              {
+                "if": "writable",
+                "then": "allow",
+                "else": {
+                  "if": "readable",
+                  "then": "ask",
+                  "else": "deny"
+                }
+              }
+            ]
+          }
+        },
+
+        "unzip": {
+          "decision": "ask",
+          "cwdCheck": {
+            "if": "writable",
+            "then": "allow",
+            "else": {
+              "if": "readable",
+              "then": "ask",
+              "else": "deny"
+            }
+          },
+          "flags": {
+            "-l": "allow",
+            "-t": "allow",
+            "-p": "allow"
+          },
+          "options": {
+            "-d": {
+              "if": "writable",
+              "then": "allow",
+              "else": {
+                "if": "readable",
+                "then": "ask",
+                "else": "deny"
+              }
+            }
+          },
+          "positional": {
+            "*": {
+              "if": "readable",
+              "then": "allow",
+              "else": "deny"
+            }
+          }
+        },
+
+        "_comment_synthetic": "allow",
+
+        "npm": {
+          "decision": "ask",
+          "subcmds": {
+            "install": "allow",
+            "test": "allow",
+            "run": "allow",
+            "publish": "deny",
+            "*": { "decision": "ask" }
+          }
+        },
+
+        "make": {
+          "decision": "ask",
+          "flags": {
+            "-j": "allow",
+            "--dry-run": {
+              "decision": "allow",
+              "aliases": ["-n"]
+            },
+            "*": "allow"
+          }
+        },
+
+        "curl": {
+          "decision": "ask",
+          "options": {
+            "--request": {
+              "decision": "ask",
+              "aliases": ["-X"],
+              "values": {
+                "GET": "allow",
+                "HEAD": "allow",
+                "DELETE": "deny",
+                "*": "ask"
+              }
+            },
+            "--output": {
+              "decision": "ask",
+              "aliases": ["-o"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": "deny"
+                }
+              }
+            }
+          }
+        },
+
+        "env": {
+          "decision": "allow",
+          "allowExpansions": true
+        },
+
+        "patch": {
+          "decision": "ask",
+          "flags": {
+            "--dry-run": "allow",
+            "-i": {
+              "positional": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": "ask"
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": {
+              "if": "readable",
+              "then": "allow",
+              "else": "deny"
+            }
+          }
+        },
+
+        "fd": {
+          "decision": "allow",
+          "flags": {
+            "*": "allow",
+            "-x": { "decision": "ask", "aliases": ["--exec"] },
+            "-X": { "decision": "ask", "aliases": ["--exec-batch"] }
+          }
+        },
+
+        "file": {
+          "decision": "allow",
+          "flags": {
+            "-C": { "decision": "ask", "aliases": ["--compile"] }
+          }
+        },
+
+        "info": {
+          "decision": "allow",
+          "options": {
+            "-o": {
+              "decision": "allow",
+              "aliases": ["--output"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          }
+        },
+
+        "man": {
+          "decision": "allow",
+          "options": {
+            "-P": {
+              "decision": "allow",
+              "aliases": ["--pager"],
+              "values": {
+                "*": "ask",
+                "bat": "allow",
+                "cat": "allow",
+                "less": "allow",
+                "more": "allow",
+                "most": "allow"
+              }
+            }
+          }
+        },
+
+        "mktemp": {
+          "decision": "allow",
+          "options": {
+            "-p": {
+              "decision": "allow",
+              "aliases": ["--tmpdir"],
+              "values": {
+                "*": {
+                  "if": "writable",
+                  "then": "allow",
+                  "else": {
+                    "if": "readable",
+                    "then": "ask",
+                    "else": "deny"
+                  }
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": {
+              "if": "writable",
+              "then": "allow",
+              "else": {
+                "if": "readable",
+                "then": "ask",
+                "else": "deny"
+              }
+            }
+          }
+        }
+      }
+    },
+    "Read": { "if": "readable", "then": "allow", "else": "deny" },
+    "Write": {
+      "if": "writable",
+      "then": "allow",
+      "else": { "if": "readable", "then": "ask", "else": "deny" }
+    },
+    "Edit": {
+      "if": "writable",
+      "then": "allow",
+      "else": { "if": "readable", "then": "ask", "else": "deny" }
+    },
+    "NotebookEdit": {
+      "if": "writable",
+      "then": "allow",
+      "else": { "if": "readable", "then": "ask", "else": "deny" }
+    },
+    "Glob": { "if": "readable", "then": "allow", "else": "deny" },
+    "Grep": { "if": "readable", "then": "allow", "else": "deny" },
+    "LSP": "allow",
+    "Agent": "allow",
+    "Skill": "allow",
+    "TaskCreate": "allow",
+    "TaskGet": "allow",
+    "TaskList": "allow",
+    "TaskUpdate": "allow",
+    "TaskStop": "allow",
+    "ToolSearch": "allow",
+    "ListMcpResourcesTool": "allow",
+    "ReadMcpResourceTool": "allow",
+    "WebFetch": "allow",
+    "WebSearch": "allow",
+    "AskUserQuestion": "allow",
+    "EnterPlanMode": "allow",
+    "ExitPlanMode": "allow"
+  },
+  "fileAccess": {
+    "read": {
+      "globPatterns": [
+        "**",
+        "!**/*.env*",
+        "!**/*.key*",
+        "!**/*.pem*",
+        "!**/*credentials*",
+        "!**/*id_ed25519*",
+        "!**/*id_rsa*",
+        "!**/*secret*"
+      ]
+    },
+    "write": {
+      "globPatterns": ["/tmp/**", "/workspace/**"],
+      "requireReadable": true
+    }
+  }
+}
