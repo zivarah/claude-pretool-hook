@@ -216,6 +216,30 @@ fn bash_version_overrides_deny() {
     assert_decision(&bash_input("dd --version"), "allow");
 }
 
+#[test]
+fn bash_wrapper_help_allowed() {
+    // timeout --help: wrapper strips `timeout`, --help is the only remaining
+    // arg — should be auto-allowed, not "unknown command"
+    assert_decision(&bash_input("timeout --help"), "allow");
+}
+
+#[test]
+fn bash_wrapper_command_help_allowed() {
+    // command --help: wrapper strips `command`, --help remains
+    assert_decision(&bash_input("command --help"), "allow");
+}
+
+#[test]
+fn bash_wrapper_version_allowed() {
+    assert_decision(&bash_input("timeout --version"), "allow");
+}
+
+#[test]
+fn bash_wrapper_help_in_pipe_allowed() {
+    // timeout --help 2>&1 | head -50: both commands should be allowed
+    assert_decision(&bash_input("timeout --help 2>&1 | head -50"), "allow");
+}
+
 // =============================================================================
 // Bash tool — subcmds
 // =============================================================================

@@ -234,6 +234,26 @@ fn evaluate_commands(
     let mut all_path_checks = Vec::new();
 
     for command in commands {
+        // Check --help/--version on original args before wrapper stripping.
+        // Wrapper stripping can consume all args (e.g., `timeout --help`
+        // strips `timeout` then skipPositional eats `--help`, leaving an
+        // empty command). The auto-allow check in evaluate_command only
+        // sees the stripped args, so we need to catch this case here.
+        if command.args.len() == 2
+            && (command.args[1] == "--help" || command.args[1] == "--version")
+        {
+            let result = EvalResult::Decided {
+                decision: Decision::Allow,
+                reason: format!(
+                    "'{} {}' is always allowed",
+                    command.args[0], command.args[1]
+                ),
+            };
+            all_plain.push(Decision::Allow);
+            results.push(result);
+            continue;
+        }
+
         let stripped = evaluate::strip_wrappers(command, bash_rules);
         let has_non_literal = stripped.expansion_flags.iter().any(|&e| e);
         let result = evaluate::evaluate_command(

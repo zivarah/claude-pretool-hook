@@ -259,6 +259,14 @@ pub fn evaluate_command(
             reason: format!("'{} {}' is always allowed", args[0], args[1]),
         };
     }
+    // After wrapper stripping, --help/--version may be the only remaining arg
+    // (e.g., `timeout --help` strips `timeout`, leaving just `--help`).
+    if args.len() == 1 && (args[0] == "--help" || args[0] == "--version") {
+        return EvalResult::Decided {
+            decision: Decision::Allow,
+            reason: format!("'{}' is always allowed", args[0]),
+        };
+    }
 
     let cmd = &args[0];
     let original = fmt_cmd(args);
@@ -884,6 +892,19 @@ mod tests {
     fn version_flag_always_allow() {
         // dd is deny, but --version always overrides to allow
         let result = eval(&["dd", "--version"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn bare_help_after_wrapper_strip_allow() {
+        // After wrapper stripping, --help may be the sole remaining arg
+        let result = eval(&["--help"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn bare_version_after_wrapper_strip_allow() {
+        let result = eval(&["--version"]);
         assert_eq!(decision(&result), Decision::Allow);
     }
 
