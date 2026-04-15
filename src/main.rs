@@ -202,7 +202,8 @@ fn handle_bash(
 
     // If any plain decision is deny, return deny immediately.
     if all_plain.contains(&Decision::Deny) {
-        let reason = collect_deny_reasons(&results);
+        let pairs = collect_eval_reason_pairs(&results);
+        let reason = join_reasons(Decision::Deny, &pairs);
         return Ok(create_response(Decision::Deny, &reason));
     }
 
@@ -215,7 +216,8 @@ fn handle_bash(
     // Merge all plain decisions.
     if !all_plain.is_empty() {
         let merged = merge(&all_plain);
-        let reason = collect_eval_reasons(&results);
+        let pairs = collect_eval_reason_pairs(&results);
+        let reason = join_reasons(merged, &pairs);
         return Ok(create_response(merged, &reason));
     }
 
@@ -359,53 +361,50 @@ fn merge_with_path_results(
         .collect();
     let merged = merge(&all_decisions);
 
-    let mut all_reasons: Vec<&str> = results
-        .iter()
-        .map(|r| match r {
-            EvalResult::Decided { reason, .. } | EvalResult::CheckPaths { reason, .. } => {
-                reason.as_str()
-            }
-        })
-        .filter(|r| !r.is_empty())
-        .collect();
-    all_reasons.extend(path_results.iter().map(|(_, _, r)| r.as_str()));
-    let reason = all_reasons.join("; ");
+    let mut pairs = collect_eval_reason_pairs(results);
+    pairs.extend(path_results.iter().map(|(d, _, r)| (*d, r.as_str())));
+    let reason = join_reasons(merged, &pairs);
     Ok(create_response(merged, &reason))
 }
 
-/// Collect reasons from deny results.
-fn collect_deny_reasons(results: &[EvalResult]) -> String {
-    let reasons: Vec<&str> = results
-        .iter()
-        .filter_map(|r| match r {
-            EvalResult::Decided {
-                decision: Decision::Deny,
-                reason,
-            } => Some(reason.as_str()),
-            EvalResult::CheckPaths {
-                base_decision: Decision::Deny,
-                reason,
-                ..
-            } => Some(reason.as_str()),
-            _ => None,
-        })
-        .collect();
-    if reasons.is_empty() {
-        "denied by collected decisions".into()
-    } else {
-        reasons.join("; ")
-    }
-}
-
-/// Collect reasons from all eval results.
-fn collect_eval_reasons(results: &[EvalResult]) -> String {
+/// Collect (decision, reason) pairs from eval results.
+fn collect_eval_reason_pairs(results: &[EvalResult]) -> Vec<(Decision, &str)> {
     results
         .iter()
         .filter_map(|r| match r {
-            EvalResult::Decided { reason, .. } => Some(reason.as_str()),
-            _ => None,
+            EvalResult::Decided { decision, reason }
+            | EvalResult::CheckPaths {
+                base_decision: decision,
+                reason,
+                ..
+            } => {
+                if reason.is_empty() {
+                    None
+                } else {
+                    Some((*decision, reason.as_str()))
+                }
+            }
         })
-        .filter(|r| !r.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect()
+}
+
+/// Join reason fragments, filtering out Allow-decision fragments when the
+/// final decision is not Allow. This reduces noise so the user only sees
+/// what needs attention.
+fn join_reasons(final_decision: Decision, pairs: &[(Decision, &str)]) -> String {
+    if final_decision == Decision::Allow {
+        return pairs.iter().map(|(_, r)| *r).collect::<Vec<_>>().join("; ");
+    }
+    let filtered: Vec<&str> = pairs
+        .iter()
+        .filter(|(d, _)| *d != Decision::Allow)
+        .map(|(_, r)| *r)
+        .collect();
+    if filtered.is_empty() {
+        // Shouldn't happen with a non-Allow final decision, but fall back
+        // to showing everything rather than an empty string.
+        pairs.iter().map(|(_, r)| *r).collect::<Vec<_>>().join("; ")
+    } else {
+        filtered.join("; ")
+    }
 }

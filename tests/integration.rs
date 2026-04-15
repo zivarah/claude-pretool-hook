@@ -537,6 +537,48 @@ fn bash_chain_semicolon_deny() {
 }
 
 // =============================================================================
+// Bash tool — reason filtering (no "is approved" noise in ask/deny)
+// =============================================================================
+
+#[test]
+fn bash_pipe_deny_reason_omits_approved() {
+    // ls foo | dd → dd is deny, ls is allow.
+    // The reason should mention dd being denied but NOT "ls" being approved.
+    let (_, decision, reason) = run_hook(&bash_input("ls foo | dd"));
+    assert_eq!(decision, "deny");
+    assert!(
+        !reason.contains("is approved"),
+        "deny reason should not contain 'is approved' fragments: {reason}"
+    );
+    assert!(
+        reason.contains("is denied"),
+        "deny reason should mention the denied command: {reason}"
+    );
+}
+
+#[test]
+fn bash_pipe_ask_reason_omits_approved() {
+    // cat foo | totally-unknown-cmd → unknown is ask, cat is allow.
+    let (_, decision, reason) = run_hook(&bash_input("cat foo | totally-unknown-cmd"));
+    assert_eq!(decision, "ask");
+    assert!(
+        !reason.contains("is approved"),
+        "ask reason should not contain 'is approved' fragments: {reason}"
+    );
+}
+
+#[test]
+fn bash_allow_reason_keeps_approved() {
+    // ls foo | cat → both allow. Reason should still contain "is approved".
+    let (_, decision, reason) = run_hook(&bash_input("ls foo | cat"));
+    assert_eq!(decision, "allow");
+    assert!(
+        reason.contains("is approved"),
+        "allow reason should keep 'is approved' fragments: {reason}"
+    );
+}
+
+// =============================================================================
 // Bash tool — redirects
 // =============================================================================
 
