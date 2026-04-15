@@ -236,14 +236,12 @@ fn evaluate_commands(
     let mut all_path_checks = Vec::new();
 
     for command in commands {
-        // Check --help/--version on original args before wrapper stripping.
-        // Wrapper stripping can consume all args (e.g., `timeout --help`
-        // strips `timeout` then skipPositional eats `--help`, leaving an
-        // empty command). The auto-allow check in evaluate_command only
-        // sees the stripped args, so we need to catch this case here.
-        if command.args.len() == 2
-            && (command.args[1] == "--help" || command.args[1] == "--version")
-        {
+        // Check globally allowed flags on original args before wrapper
+        // stripping. Wrapper stripping can consume all args (e.g.,
+        // `timeout --help` strips `timeout` then skipPositional eats
+        // `--help`, leaving an empty command). The auto-allow check in
+        // evaluate_command only sees the stripped args, so we catch it here.
+        if command.args.len() == 2 && bash_rules.globally_allowed_flags.contains(&command.args[1]) {
             let result = EvalResult::Decided {
                 decision: Decision::Allow,
                 reason: format!(

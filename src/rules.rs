@@ -27,9 +27,16 @@ pub struct ToolEntry {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BashRules {
     #[serde(default)]
     pub commands: HashMap<String, CommandNode>,
+    /// Flags that auto-allow a command when they are the sole argument
+    /// (e.g., `["--help", "--version"]`). When a command is invoked with
+    /// exactly one of these flags and nothing else, the command is allowed
+    /// regardless of other rules.
+    #[serde(default)]
+    pub globally_allowed_flags: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

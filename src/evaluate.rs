@@ -252,16 +252,18 @@ pub fn evaluate_command(
         };
     }
 
-    // --help / --version is always allowed.
-    if args.len() == 2 && (args[1] == "--help" || args[1] == "--version") {
+    // Globally allowed flags: when the sole argument is one of these flags,
+    // the command is auto-allowed regardless of other rules.
+    if args.len() == 2 && rules.globally_allowed_flags.contains(&args[1]) {
         return EvalResult::Decided {
             decision: Decision::Allow,
             reason: format!("'{} {}' is always allowed", args[0], args[1]),
         };
     }
-    // After wrapper stripping, --help/--version may be the only remaining arg
-    // (e.g., `timeout --help` strips `timeout`, leaving just `--help`).
-    if args.len() == 1 && (args[0] == "--help" || args[0] == "--version") {
+    // After wrapper stripping, a globally allowed flag may be the only
+    // remaining arg (e.g., `timeout --help` strips `timeout`, leaving
+    // just `--help`).
+    if args.len() == 1 && rules.globally_allowed_flags.contains(&args[0]) {
         return EvalResult::Decided {
             decision: Decision::Allow,
             reason: format!("'{}' is always allowed", args[0]),

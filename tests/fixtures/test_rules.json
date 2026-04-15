@@ -1,6 +1,7 @@
 {
   "tools": {
     "Bash": {
+      "globallyAllowedFlags": ["--help", "--version"],
       "commands": {
         "ls": "allow",
         "cat": "allow",

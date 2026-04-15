@@ -40,6 +40,9 @@ Tools are divided into two groups based on how they're evaluated:
 - **`Bash`** -- special handling. The command string is parsed using
   tree-sitter-bash and evaluated against command decision trees. Shell
   redirects (`>`, `>>`, etc.) automatically get writable path checks.
+  The `globallyAllowedFlags` list (e.g. `["--help", "--version"]`)
+  auto-allows any command invoked with exactly one of those flags as
+  its sole argument, regardless of other rules.
 
 ### Command decision trees
 
