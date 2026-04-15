@@ -187,6 +187,11 @@ Either a bare decision string, a bare conditional, or a full object:
 "-C": { "if": "writable", "then": "allow", "else": "deny" }
 ```
 
+Both space-separated (`--output /tmp/file`) and equals-separated
+(`--output=/tmp/file`) forms are recognized. For the equals form, the
+argument is split on the first `=` and the option name is looked up
+normally (including alias matching).
+
 ### Positional def
 
 Keyed by argument count (`"1"`, `"2"`, etc.) or `"*"` for any count. Values

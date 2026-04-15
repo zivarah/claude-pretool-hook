@@ -901,9 +901,57 @@ fn bash_git_log_output_writable() {
     assert_decision(&bash_input("git log --output /tmp/out.log"), "allow");
 }
 
-// TODO: --output=FILE (equals form) won't match the option entry.
-// It falls through as an unrecognized flag → ask. Safe but not ideal.
-// The hook should learn to split --long-option=value on '='.
+// =============================================================================
+// Bash tool — --option=value (equals form) splitting
+// =============================================================================
+
+#[test]
+fn bash_git_show_output_eq_writable() {
+    // --output=/tmp/out.patch should be split into --output + /tmp/out.patch
+    assert_decision(&bash_input("git show --output=/tmp/out.patch"), "allow");
+}
+
+#[test]
+fn bash_git_show_output_eq_not_writable() {
+    assert_decision(&bash_input("git show --output=/etc/out.patch"), "ask");
+}
+
+#[test]
+fn bash_git_diff_output_eq_writable() {
+    assert_decision(&bash_input("git diff --output=/tmp/diff.patch"), "allow");
+}
+
+#[test]
+fn bash_curl_output_eq_writable() {
+    // Also test with a non-git option — curl has --output with aliases
+    assert_decision(
+        &bash_input("curl --request GET --output=/tmp/out.json http://example.com"),
+        "allow",
+    );
+}
+
+#[test]
+fn bash_curl_output_eq_not_writable() {
+    assert_decision(
+        &bash_input("curl --request GET --output=/etc/out.json http://example.com"),
+        "deny",
+    );
+}
+
+#[test]
+fn bash_sort_output_eq_writable() {
+    assert_decision(
+        &bash_input("sort --output=/tmp/sorted.txt input.txt"),
+        "allow",
+    );
+}
+
+#[test]
+fn bash_git_pre_subcmd_option_eq() {
+    // git -c key=value uses = in the value, but -c is a known option
+    // so it should match via direct lookup (not eq splitting)
+    assert_decision(&bash_input("git -c core.editor=vim status"), "ask");
+}
 
 // =============================================================================
 // Bash tool — dotnet output path options

@@ -60,6 +60,35 @@ fn merge_judgments(judgments: &[Judgment]) -> Judgment {
         })
 }
 
+/// Split `--option=value` into `("--option", Some("value"))`.
+/// Returns `None` if the arg doesn't contain `=` after a leading `-`.
+fn split_option_eq(arg: &str) -> Option<(&str, &str)> {
+    if arg.starts_with('-') {
+        arg.split_once('=')
+    } else {
+        None
+    }
+}
+
+/// Look up an option by name, trying `--option=value` splitting if the direct
+/// lookup fails. Returns the matched entry and the extracted value.
+fn lookup_option_with_eq<'a>(
+    arg: &'a str,
+    options: &'a WildcardMap<OptionEntry>,
+) -> Option<(&'a OptionEntry, &'a str)> {
+    // Try direct match first (space-separated form: --output /tmp/file)
+    if let Some(entry) = lookup_with_alias(arg, options) {
+        return Some((entry, ""));
+    }
+    // Try splitting on '=' (--output=/tmp/file)
+    if let Some((name, value)) = split_option_eq(arg) {
+        if let Some(entry) = lookup_with_alias(name, options) {
+            return Some((entry, value));
+        }
+    }
+    None
+}
+
 /// Positional arg with its original index in the args array.
 struct Positional {
     index: usize,
@@ -81,7 +110,7 @@ fn extract_positionals(
                     continue;
                 }
             }
-            i += 1; // skip flag
+            i += 1; // skip --flag or --option=<value>
         } else {
             result.push(Positional {
                 index: i,
@@ -162,12 +191,21 @@ pub fn strip_wrappers(cmd: &ExtractedCommand, rules: &BashRules) -> StrippedComm
             }
             if let Some(options) = &node.options {
                 if lookup_with_alias(head, options).is_some() {
+                    // Space-separated: consume option + value
                     args.remove(0);
                     efl.remove(0);
                     if !args.is_empty() {
                         args.remove(0);
                         efl.remove(0);
                     }
+                    continue;
+                }
+                // --option=value: value is embedded, consume only this one arg
+                if split_option_eq(head)
+                    .is_some_and(|(name, _)| lookup_with_alias(name, options).is_some())
+                {
+                    args.remove(0);
+                    efl.remove(0);
                     continue;
                 }
             }
@@ -366,7 +404,7 @@ fn evaluate_node(
             } else if node
                 .options
                 .as_ref()
-                .is_some_and(|opts| lookup_with_alias(arg, opts).is_some())
+                .is_some_and(|opts| lookup_option_with_eq(arg, opts).is_some())
             {
                 // This dash-arg is a known option (flag-with-value); the
                 // options loop below will handle it — skip it here so we
@@ -386,6 +424,7 @@ fn evaluate_node(
         while i < args.len() {
             if args[i].starts_with('-') {
                 if let Some(entry) = lookup_with_alias(&args[i], options) {
+                    // Space-separated form: --output /tmp/file
                     let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
                     evaluate_option_value(
                         entry,
@@ -395,6 +434,18 @@ fn evaluate_node(
                         &mut judgments,
                         &mut path_checks,
                     );
+                } else if let Some((name, eq_value)) = split_option_eq(&args[i]) {
+                    if let Some(entry) = lookup_with_alias(name, options) {
+                        // Equals form: --output=/tmp/file
+                        evaluate_option_value(
+                            entry,
+                            name,
+                            eq_value,
+                            cmd_str,
+                            &mut judgments,
+                            &mut path_checks,
+                        );
+                    }
                 }
             }
             i += 1;
@@ -686,6 +737,7 @@ fn collect_pre_subcmd_decisions(
         if !found {
             if let Some(options) = &node.options {
                 if let Some(entry) = lookup_with_alias(arg, options) {
+                    // Space-separated form: --option value
                     let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
                     evaluate_option_value(
                         entry,
@@ -697,6 +749,20 @@ fn collect_pre_subcmd_decisions(
                     );
                     found = true;
                     i += 1; // skip the option's value
+                } else if let Some((name, eq_value)) = split_option_eq(arg) {
+                    if let Some(entry) = lookup_with_alias(name, options) {
+                        // Equals form: --option=value
+                        evaluate_option_value(
+                            entry,
+                            name,
+                            eq_value,
+                            cmd_str,
+                            &mut judgments,
+                            &mut path_checks,
+                        );
+                        found = true;
+                        // No i += 1 — value is embedded in this arg
+                    }
                 }
             }
         }
@@ -726,9 +792,18 @@ fn check_expansion_coverage(args: &[String], expansion_flags: &[bool], node: &Co
     if let Some(options) = &node.options {
         for (i, arg) in args.iter().enumerate().skip(1) {
             if arg.starts_with('-') {
-                if let Some(entry) = lookup_with_alias(arg, options) {
+                let entry = lookup_with_alias(arg, options).or_else(|| {
+                    split_option_eq(arg).and_then(|(name, _)| lookup_with_alias(name, options))
+                });
+                if let Some(entry) = entry {
                     if entry.allow_expansions {
-                        covered.push(i + 1);
+                        // For --option=value form, the expansion is in the
+                        // same arg (index i), not the next one.
+                        if split_option_eq(arg).is_some() {
+                            covered.push(i);
+                        } else {
+                            covered.push(i + 1);
+                        }
                     }
                 }
             }
@@ -1372,6 +1447,88 @@ mod tests {
                 assert!(path_checks.iter().any(|pc| pc.path == "/tmp/project"));
             }
             _ => panic!("expected CheckPaths due to cwdCheck, got Decided"),
+        }
+    }
+
+    // --- split_option_eq ---
+
+    #[test]
+    fn split_option_eq_long_option() {
+        assert_eq!(
+            split_option_eq("--output=/tmp/file"),
+            Some(("--output", "/tmp/file"))
+        );
+    }
+
+    #[test]
+    fn split_option_eq_short_option() {
+        assert_eq!(split_option_eq("-o=/tmp/file"), Some(("-o", "/tmp/file")));
+    }
+
+    #[test]
+    fn split_option_eq_no_equals() {
+        assert_eq!(split_option_eq("--output"), None);
+    }
+
+    #[test]
+    fn split_option_eq_no_dash() {
+        assert_eq!(split_option_eq("output=/tmp/file"), None);
+    }
+
+    #[test]
+    fn split_option_eq_empty_value() {
+        assert_eq!(split_option_eq("--output="), Some(("--output", "")));
+    }
+
+    #[test]
+    fn split_option_eq_value_with_equals() {
+        // git -c key=value — the first = is the split point
+        assert_eq!(
+            split_option_eq("--config=core.editor=vim"),
+            Some(("--config", "core.editor=vim"))
+        );
+    }
+
+    // --- option with = form in evaluate_command ---
+
+    #[test]
+    fn option_eq_form_produces_path_check() {
+        let rules = test_rules();
+        let bash = test_bash_rules(&rules);
+        // curl --output=/tmp/file should produce a path check for /tmp/file
+        let (a, e) = args(&["curl", "--request", "GET", "--output=/tmp/file"]);
+        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        match &result {
+            EvalResult::CheckPaths { path_checks, .. } => {
+                assert!(
+                    path_checks.iter().any(|pc| pc.path == "/tmp/file"),
+                    "expected path check for /tmp/file"
+                );
+            }
+            _ => panic!("expected CheckPaths"),
+        }
+    }
+
+    #[test]
+    fn option_eq_form_not_reported_as_unknown_flag() {
+        let rules = test_rules();
+        let bash = test_bash_rules(&rules);
+        // sort --output=/tmp/file should NOT be an unknown flag
+        let (a, e) = args(&["sort", "--output=/tmp/sorted.txt", "input.txt"]);
+        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        match &result {
+            EvalResult::Decided { reason, .. } => {
+                assert!(
+                    !reason.contains("unknown flag"),
+                    "should not report --output=... as unknown flag: {reason}"
+                );
+            }
+            EvalResult::CheckPaths { reason, .. } => {
+                assert!(
+                    !reason.contains("unknown flag"),
+                    "should not report --output=... as unknown flag: {reason}"
+                );
+            }
         }
     }
 }
