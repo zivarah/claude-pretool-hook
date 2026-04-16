@@ -69,7 +69,7 @@
         "find": {
           "decision": "allow",
           "flags": {
-            "*": "allow",
+            "*": "ask",
             "-delete": "deny",
             "-exec": "deny",
             "-execdir": "deny",
@@ -77,6 +77,8 @@
             "-okdir": "deny"
           },
           "options": {
+            "-name": "allow",
+            "-type": "allow",
             "-fprint": {
               "decision": "allow",
               "values": {

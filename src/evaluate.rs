@@ -401,6 +401,16 @@ fn evaluate_node(
             if !arg.starts_with('-') {
                 continue;
             }
+            // A dash-arg defined as a known option is handled by the
+            // options loop below. Check options first so a flag wildcard
+            // (e.g. "*": "ask") doesn't shadow a named option's decision.
+            if node
+                .options
+                .as_ref()
+                .is_some_and(|opts| lookup_option_with_eq(arg, opts).is_some())
+            {
+                continue;
+            }
             let matched = lookup_with_alias(arg, flags).or(flags.wildcard());
             if let Some(entry) = matched {
                 collect_flag_decisions(
@@ -411,14 +421,6 @@ fn evaluate_node(
                     &mut judgments,
                     &mut path_checks,
                 );
-            } else if node
-                .options
-                .as_ref()
-                .is_some_and(|opts| lookup_option_with_eq(arg, opts).is_some())
-            {
-                // This dash-arg is a known option (flag-with-value); the
-                // options loop below will handle it — skip it here so we
-                // don't report it as an unknown flag.
             } else {
                 judgments.push(Judgment::new(
                     Decision::Ask,
@@ -729,50 +731,45 @@ fn collect_pre_subcmd_decisions(
             continue;
         }
         let mut found = false;
-        if let Some(flags) = &node.flags {
-            let matched = lookup_with_alias(arg, flags).or(flags.wildcard());
-            if let Some(entry) = matched {
-                if let FlagKind::Decision(d) = &entry.kind {
-                    judgments.push(Judgment {
-                        decision: *d,
-                        force: entry.force,
-                        reason: format!("'{}': flag '{}' {}", cmd_str, arg, d.description()),
-                    });
-                }
-                // FlagKind::Positional is not evaluated here — pre-subcmd
-                // flags don't have positional args to overlay onto.
+        // Check options before flags: a named option should not be
+        // shadowed by a flag wildcard match.
+        if let Some(options) = &node.options {
+            if let Some(entry) = lookup_with_alias(arg, options) {
+                // Space-separated form: --option value
+                let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
+                evaluate_option_value(entry, arg, value, cmd_str, &mut judgments, &mut path_checks);
                 found = true;
-            }
-        }
-        if !found {
-            if let Some(options) = &node.options {
-                if let Some(entry) = lookup_with_alias(arg, options) {
-                    // Space-separated form: --option value
-                    let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
+                i += 1; // skip the option's value
+            } else if let Some((name, eq_value)) = split_option_eq(arg) {
+                if let Some(entry) = lookup_with_alias(name, options) {
+                    // Equals form: --option=value
                     evaluate_option_value(
                         entry,
-                        arg,
-                        value,
+                        name,
+                        eq_value,
                         cmd_str,
                         &mut judgments,
                         &mut path_checks,
                     );
                     found = true;
-                    i += 1; // skip the option's value
-                } else if let Some((name, eq_value)) = split_option_eq(arg) {
-                    if let Some(entry) = lookup_with_alias(name, options) {
-                        // Equals form: --option=value
-                        evaluate_option_value(
-                            entry,
-                            name,
-                            eq_value,
-                            cmd_str,
-                            &mut judgments,
-                            &mut path_checks,
-                        );
-                        found = true;
-                        // No i += 1 — value is embedded in this arg
+                    // No i += 1 — value is embedded in this arg
+                }
+            }
+        }
+        if !found {
+            if let Some(flags) = &node.flags {
+                let matched = lookup_with_alias(arg, flags).or(flags.wildcard());
+                if let Some(entry) = matched {
+                    if let FlagKind::Decision(d) = &entry.kind {
+                        judgments.push(Judgment {
+                            decision: *d,
+                            force: entry.force,
+                            reason: format!("'{}': flag '{}' {}", cmd_str, arg, d.description()),
+                        });
                     }
+                    // FlagKind::Positional is not evaluated here — pre-subcmd
+                    // flags don't have positional args to overlay onto.
+                    found = true;
                 }
             }
         }
