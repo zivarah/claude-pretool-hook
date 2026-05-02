@@ -76,26 +76,32 @@ pub struct CompiledWriteRules {
 }
 
 impl CompiledFileAccess {
-    /// Compile all glob patterns from `FileAccess`, including an optional
-    /// project directory pattern appended to the write list.
+    /// Compile all glob patterns from `FileAccess`. When `project_dir` is
+    /// provided, `<dir>/**` is prepended to both the read and write lists
+    /// so that user-supplied negations (which come after, and win under
+    /// last-match-wins) can still carve exceptions out of the project dir.
     pub fn compile(
         file_access: &FileAccess,
         cwd: &Path,
         project_dir: Option<&str>,
     ) -> Result<Self, PathError> {
-        let read = CompiledAccessRules {
-            patterns: CompiledPatterns::compile(&file_access.read.glob_patterns)?,
-        };
-
+        let mut read_patterns = file_access.read.glob_patterns.clone();
         let mut write_patterns = file_access.write.glob_patterns.clone();
+
         if let Some(dir) = project_dir {
             if let Ok(mut normalized) = normalize_path(dir, cwd) {
                 if !normalized.ends_with('/') {
                     normalized.push('/');
                 }
-                write_patterns.push(format!("{normalized}**"));
+                read_patterns.insert(0, format!("{normalized}**"));
+                write_patterns.insert(0, format!("{normalized}**"));
             }
         }
+
+        let read = CompiledAccessRules {
+            patterns: CompiledPatterns::compile(&read_patterns)?,
+        };
+
         let write = CompiledWriteRules {
             patterns: CompiledPatterns::compile(&write_patterns)?,
             require_readable: file_access.write.require_readable,
@@ -354,6 +360,106 @@ mod tests {
         .unwrap();
         assert!(is_writable("/my/project/src/lib.rs", &fa, &cwd()).unwrap());
         assert!(!is_writable("/other/path", &fa, &cwd()).unwrap());
+    }
+
+    #[test]
+    fn readable_project_dir_added() {
+        // With no user read patterns, the project dir alone makes files
+        // inside it readable.
+        let fa = CompiledFileAccess::compile(
+            &FileAccess {
+                read: crate::rules::AccessRules {
+                    glob_patterns: vec![],
+                },
+                write: crate::rules::WriteRules {
+                    glob_patterns: vec![],
+                    require_readable: false,
+                },
+            },
+            &cwd(),
+            Some("/my/project"),
+        )
+        .unwrap();
+        assert!(is_readable("/my/project/src/lib.rs", &fa, &cwd()).unwrap());
+        assert!(!is_readable("/other/path", &fa, &cwd()).unwrap());
+    }
+
+    #[test]
+    fn user_read_negation_overrides_project_dir() {
+        // Project dir is prepended; the user's negation comes later in the
+        // list and wins under last-match-wins semantics.
+        let fa = CompiledFileAccess::compile(
+            &FileAccess {
+                read: crate::rules::AccessRules {
+                    glob_patterns: vec!["!**/*.secret*".into()],
+                },
+                write: crate::rules::WriteRules {
+                    glob_patterns: vec![],
+                    require_readable: false,
+                },
+            },
+            &cwd(),
+            Some("/my/project"),
+        )
+        .unwrap();
+        // Files inside the project dir but matching the user negation are
+        // NOT readable — the negation overrides the auto-added project dir.
+        assert!(!is_readable("/my/project/api.secret", &fa, &cwd()).unwrap());
+        // Other files in the project dir are still readable.
+        assert!(is_readable("/my/project/src/lib.rs", &fa, &cwd()).unwrap());
+    }
+
+    #[test]
+    fn user_write_negation_overrides_project_dir() {
+        // Same as above, but for write patterns.
+        let fa = CompiledFileAccess::compile(
+            &FileAccess {
+                read: crate::rules::AccessRules {
+                    glob_patterns: vec!["**".into()],
+                },
+                write: crate::rules::WriteRules {
+                    glob_patterns: vec!["!**/dist/**".into()],
+                    require_readable: false,
+                },
+            },
+            &cwd(),
+            Some("/my/project"),
+        )
+        .unwrap();
+        // Files matching the user negation are NOT writable, even though
+        // they're inside the auto-added project dir.
+        assert!(!is_writable("/my/project/dist/bundle.js", &fa, &cwd()).unwrap());
+        // Other files in the project dir are still writable.
+        assert!(is_writable("/my/project/src/lib.rs", &fa, &cwd()).unwrap());
+    }
+
+    #[test]
+    fn user_negation_then_re_allow_overrides_project_dir() {
+        // Verifies the project dir is prepended (not appended): a user
+        // negation followed by a re-allow on the same path produces the
+        // re-allow as the final result. If the project dir were appended
+        // instead, the project-dir glob would be the last match for any
+        // path under it and the user re-allow would have no effect on
+        // anything outside the project dir — but more importantly, this
+        // exercises the ordering: user patterns must come *after* the
+        // project-dir auto-add so that a user "!**/*.tmp*" can still be
+        // overridden by a later user "**/keep.tmp" entry.
+        let fa = CompiledFileAccess::compile(
+            &FileAccess {
+                read: crate::rules::AccessRules {
+                    glob_patterns: vec!["!**/*.tmp*".into(), "**/keep.tmp".into()],
+                },
+                write: crate::rules::WriteRules {
+                    glob_patterns: vec![],
+                    require_readable: false,
+                },
+            },
+            &cwd(),
+            Some("/my/project"),
+        )
+        .unwrap();
+        assert!(is_readable("/my/project/keep.tmp", &fa, &cwd()).unwrap());
+        assert!(!is_readable("/my/project/scratch.tmp", &fa, &cwd()).unwrap());
     }
 
     // --- CompiledPatterns ---
