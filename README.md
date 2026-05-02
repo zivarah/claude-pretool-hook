@@ -38,16 +38,21 @@ Tools are divided into two groups based on how they're evaluated:
   `StaticDecisionNode`.
 
 - **`Bash`** -- special handling. The command string is parsed using
-  tree-sitter-bash and evaluated against command decision trees. Shell
-  redirects (`>`, `>>`, etc.) automatically get writable path checks.
-  The `globallyAllowedFlags` list (e.g. `["--help", "--version"]`)
-  auto-allows any command invoked with exactly one of those flags as
-  its sole argument, regardless of other rules.
+  tree-sitter-bash and evaluated against command decision trees.
+  - Shell redirects (`>`, `>>`, etc.) automatically get a writable conditional
+    path check (writable -> allow, else readable -> ask, else deny).
+  - Commands inside command substitutions (e.g. `$(...)`) are recursively
+    extracted and evaluated independently. The `globallyAllowedFlags` list (e.g.
+    `["--help", "--version"]`) auto-allows any command invoked with exactly one
+    of those flags as its sole argument, regardless of other rules. The
+    auto-allow also fires when wrapper stripping leaves just the flag (e.g.
+    `timeout --help`).
 
 ### Command decision trees
 
 Each Bash command is a decision tree with decisions at every level. The
-strictest decision wins: **deny > ask > allow**.
+strictest decision wins: **deny > ask > allow**, except when a `force`
+decision is in play (see [Forced decisions](#forced-decisions)).
 
 ### Core principles
 
@@ -107,6 +112,96 @@ The same logic applies to `subcmds`, `options`, and `positional` dicts:
 absent = transparent, present with `*` = wildcard default, present without `*` =
 "ask" for unlisted entries.
 
+### Forced decisions
+
+Flags, options, option values, and wrapper flags can set `"force": true` to
+override the normal "strictest wins" merging. A forced decision takes priority
+over any non-forced decision in the same evaluation. Multiple forced decisions
+that agree are applied; multiple forced decisions that disagree resolve to
+"ask" (treated as a conflict).
+
+The canonical use is `command -v <name>`: even if `<name>` would otherwise be
+denied, `command -v` is a read-only lookup that should be allowed. Marking
+`-v` as `{"decision": "allow", "force": true}` on the `command` wrapper makes
+the inner command auto-allowed (see [Wrappers](#wrappers)).
+
+```json
+"command": {
+  "decision": "ask",
+  "isWrapper": true,
+  "flags": {
+    "-v": { "decision": "allow", "force": true },
+    "-V": { "decision": "allow", "force": true }
+  }
+}
+```
+
+### Wrappers
+
+A command marked `"isWrapper": true` is stripped from the front of the
+argument list before the inner command is evaluated. Stripping consumes:
+
+1. The wrapper's own command name.
+2. Any of the wrapper's known flags or `option <value>` / `option=value`
+   pairs found at the front of the args, including a literal `--`
+   separator (which stops flag consumption).
+3. `skipPositional` positional arguments after the flags (e.g.,
+   `timeout 5 ls` declares `skipPositional: 1` to consume the duration).
+
+The remaining args are then evaluated as if they were the original command.
+Wrappers chain: `timeout 5 timeout 10 ls` strips both `timeout` invocations.
+
+If a wrapper flag is matched and that flag has `force: true`, wrapper
+stripping short-circuits and the entire command is force-allowed (used by
+`command -v`/`command -V`).
+
+### Expansion handling
+
+Tree-sitter classifies each argument as either fully literal or containing
+non-literal parts (variable expansions like `$VAR`, command substitutions
+like `$(...)`, etc.). By default, any non-literal arg in a command produces
+an "ask" judgment, since the hook can't statically reason about what the
+expansion will resolve to.
+
+Two opt-ins relax this:
+
+- **Node-level `"allowExpansions": true`** -- declared on a command node,
+  every arg may contain expansions.
+
+- **Option-level `"allowExpansions": true`** -- declared on a single option
+  entry, only the value position of that option may contain an expansion.
+  This would allow, for example, `git commit -m "$(...)"`; as long as the inner
+  command is deemed safe, this is safe to allow as the resulting string is just
+  used as the commit message (never executed).
+
+If a command has any uncovered non-literal arg, an "ask" judgment is
+added to the merge (it does not short-circuit, so a more lenient or
+stricter decision elsewhere can still win).
+
+### `cwdCheck`
+
+A command node may declare a `cwdCheck` containing a conditional decision
+that is resolved against the hook's working directory (passed in via the
+hook input, normalized in the same way as positional path checks):
+
+```json
+"unzip": {
+  "decision": "ask",
+  "cwdCheck": {
+    "if": "writable",
+    "then": "allow",
+    "else": { "if": "readable", "then": "ask", "else": "deny" }
+  },
+  "positional": {
+    "*": { "if": "readable", "then": "allow", "else": "deny" }
+  }
+}
+```
+
+This is intended for commands that write into the cwd implicitly --
+`unzip archive.zip` extracts under the cwd whether or not `-d` is given,
+so the cwd should pass the writable check even if no flag points at it.
+
 ## Source files
 
 - `main.rs` -- CLI entry point. Reads `--rules <file>` and stdin JSON,
@@ -157,6 +252,7 @@ full node:
   "flags": { "<name>": "<flag-entry>", "*": "<flag-entry>" },
   "options": { "<name>": "<option-entry>", "*": "<option-entry>" },
   "positional": { "<count>": "<positional-def>", "*": "<positional-def>" },
+  "cwdCheck": "<decision-or-conditional>",
   "isWrapper": false,
   "skipPositional": 0,
   "allowExpansions": false
@@ -173,7 +269,7 @@ Either a bare decision string or an object. A flag has exactly one of
 ```json
 // Static decision
 "-r": "deny"
-"-r": { "decision": "deny", "force": false, "aliases": ["--recursive"] }
+"-r": { "decision": "deny", "aliases": ["--recursive"] }
 
 // Positional overlay -- adds path checks to positional args when this flag
 // is present. The flag itself has no standalone decision.
@@ -189,6 +285,24 @@ Either a bare decision string, a bare conditional, or a full object:
 "-f": { "decision": "allow", "values": { "dev": "allow", "prod": "deny", "*": "ask" } }
 "-C": { "if": "writable", "then": "allow", "else": "deny" }
 ```
+
+A bare conditional is shorthand for `{"decision": "ask", "values":
+{"*": <conditional>}}` -- i.e., the option's _value_ is path-checked by
+the conditional. The `-C` example above evaluates the value of
+`git -C <dir>` against the writable patterns.
+
+Full-object fields:
+
+- `decision` (required when not bare) -- the standalone decision when
+  no `values` dict matches.
+- `aliases` -- additional names that resolve to this entry (e.g.,
+  `-X` aliased to `--request`).
+- `force` -- see [Forced decisions](#forced-decisions). On individual
+  `values` entries, `force` is also accepted via the `DecisionSpec`
+  shape: `{"decision": ..., "force": true}`.
+- `allowExpansions` -- see [Expansion handling](#expansion-handling).
+- `values` -- per-value rules (decision string, conditional, or full
+  spec with `force`). Wildcard `*` falls through to "ask" when absent.
 
 Both space-separated (`--output /tmp/file`) and equals-separated
 (`--output=/tmp/file`) forms are recognized. For the equals form, the
@@ -226,8 +340,17 @@ A decision can be a static string or a nested conditional:
 
 ### File access
 
-Glob patterns evaluated in order, last match wins. `!` prefix negates.
-`CLAUDE_PROJECT_DIR` is automatically appended to write patterns at runtime.
+Glob patterns evaluated in order, last match wins. `!` prefix negates. A path
+with no matching pattern is treated as not matching (i.e., not readable / not
+writable). Paths are normalized lexically (`.` / `..` resolved, relative paths
+joined to the hook's cwd) before matching -- no filesystem access is performed.
 
-When `requireReadable` is true, a path must pass the read patterns before
-write patterns are checked.
+If the `CLAUDE_PROJECT_DIR` environment variable is set, `<dir>/**` is prepended
+to the read/write patterns at startup, so the project root is readable/writable
+by default. You can supply explicit negations to override this (e.g.,
+`!<dir>/**`).
+
+When `requireReadable` is true on `write`, a path must pass the read patterns
+before the write patterns are checked. This means a denylist entry on `read`
+(e.g., `!**/*.secret*`) automatically also blocks writes to that path, even if
+`glob_patterns` would otherwise allow it.
