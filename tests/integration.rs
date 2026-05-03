@@ -321,6 +321,13 @@ fn bash_flag_wildcard() {
 }
 
 #[test]
+fn bash_flag_not_listed_no_wildcard() {
+    // file has flags ({-C: ask}) but no "*" wildcard. An unknown flag must
+    // produce ask, overriding the node's base "allow".
+    assert_decision(&bash_input("file --unknown-flag /tmp/foo"), "ask");
+}
+
+#[test]
 fn bash_flag_deny_wins() {
     // rm has decision allow, -r is deny → deny wins
     assert_decision(&bash_input("rm -r /tmp/file.txt"), "deny");

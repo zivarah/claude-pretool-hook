@@ -1024,6 +1024,16 @@ mod tests {
     }
 
     #[test]
+    fn flag_not_listed_no_wildcard() {
+        // file has flags dict ({-C: ask}) with no "*" wildcard. An unknown
+        // flag must produce an ask judgment that overrides the node's
+        // base "allow" — distinguishing this case from the silently-skipped
+        // behavior of unknown options.
+        let result = eval(&["file", "--unknown-flag", "/tmp/foo"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
     fn flag_deny_overrides_allow() {
         // rm has decision allow, but -r flag is deny → merged to deny
         let result = eval(&["rm", "-r", "/tmp/file.txt"]);
