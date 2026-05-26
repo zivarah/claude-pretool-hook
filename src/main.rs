@@ -196,7 +196,8 @@ fn handle_bash(
     let (commands, redirects) =
         bash::parse(cmd).with_context(|| format!("parsing bash command: {cmd:?}"))?;
 
-    let (results, all_plain, mut all_path_checks) = evaluate_commands(&commands, bash_rules, cwd);
+    let (results, all_plain, mut all_path_checks) =
+        evaluate_commands(&commands, bash_rules, fa, cwd);
 
     add_redirect_checks(&redirects, &mut all_path_checks);
 
@@ -229,6 +230,7 @@ fn handle_bash(
 fn evaluate_commands(
     commands: &[bash::ExtractedCommand],
     bash_rules: &rules::BashRules,
+    fa: &path::CompiledFileAccess,
     cwd: &Path,
 ) -> (Vec<EvalResult>, Vec<Decision>, Vec<PathCheck>) {
     let mut results = Vec::new();
@@ -256,13 +258,17 @@ fn evaluate_commands(
 
         let stripped = evaluate::strip_wrappers(command, bash_rules);
         let has_non_literal = stripped.expansion_flags.iter().any(|&e| e);
+        let eval_ctx = evaluate::EvalCtx {
+            fa,
+            cwd: cwd.to_str().unwrap_or("/"),
+        };
         let result = evaluate::evaluate_command(
             &stripped.args,
             &stripped.expansion_flags,
             has_non_literal,
             stripped.force_allow,
             bash_rules,
-            cwd.to_str().unwrap_or("/"),
+            &eval_ctx,
         );
 
         match &result {

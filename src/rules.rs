@@ -115,6 +115,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for WildcardMap<T> {
 pub struct DecisionSpec {
     pub node: DecisionNode,
     pub force: bool,
+    pub is_pattern: bool,
 }
 
 impl<'de> Deserialize<'de> for DecisionSpec {
@@ -126,21 +127,33 @@ impl<'de> Deserialize<'de> for DecisionSpec {
         #[serde(untagged)]
         enum Raw {
             // Object with a "decision" key — tried first to capture the
-            // optional "force" field before DecisionNode consumes the object.
+            // optional "force" / "isPattern" fields before DecisionNode
+            // consumes the object.
             Full {
                 decision: DecisionNode,
                 #[serde(default)]
                 force: bool,
+                #[serde(default, rename = "isPattern")]
+                is_pattern: bool,
             },
-            // Bare string ("allow") or bare conditional ({"if":...}) — force defaults to false.
+            // Bare string ("allow") or bare conditional ({"if":...}).
             Bare(DecisionNode),
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Full { decision, force } => Ok(DecisionSpec {
+            Raw::Full {
+                decision,
+                force,
+                is_pattern,
+            } => Ok(DecisionSpec {
                 node: decision,
                 force,
+                is_pattern,
             }),
-            Raw::Bare(node) => Ok(DecisionSpec { node, force: false }),
+            Raw::Bare(node) => Ok(DecisionSpec {
+                node,
+                force: false,
+                is_pattern: false,
+            }),
         }
     }
 }
@@ -308,6 +321,31 @@ pub struct OptionEntry {
     pub aliases: Vec<String>,
     pub allow_expansions: bool,
     pub values: Option<WildcardMap<DecisionSpec>>,
+    /// When set, the value is treated as a path to a file; the file's
+    /// contents are read and matched against `check_file.values` using the
+    /// same exact/pattern/wildcard rules as a normal value lookup.
+    pub check_file: Option<FileCheck>,
+}
+
+/// Opt-in companion to `OptionEntry.values` (and the analogous positional
+/// field) that runs a `values`-shaped dict against the *contents* of the
+/// referenced file rather than the literal value string.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCheck {
+    /// Exact-match / `isPattern: true` / wildcard entries, matched against
+    /// the file's contents.
+    pub values: WildcardMap<DecisionSpec>,
+    /// Decision when the file cannot be read (path blocked by file-access
+    /// globs, missing on disk, oversized, or a generic I/O error). Defaults
+    /// to `deny` — if the rule declared an intent to inspect contents,
+    /// failing to inspect cannot resolve to allow.
+    #[serde(default = "default_on_unreadable")]
+    pub on_unreadable: Decision,
+}
+
+fn default_on_unreadable() -> Decision {
+    Decision::Deny
 }
 
 impl<'de> Deserialize<'de> for OptionEntry {
@@ -333,6 +371,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 allow_expansions: bool,
                 #[serde(default)]
                 values: Option<WildcardMap<DecisionSpec>>,
+                #[serde(default, rename = "checkFile")]
+                check_file: Option<FileCheck>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -342,6 +382,7 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 aliases: vec![],
                 allow_expansions: false,
                 values: None,
+                check_file: None,
             }),
             Raw::BareConditional(cond) => Ok(OptionEntry {
                 decision: Decision::Ask,
@@ -353,8 +394,10 @@ impl<'de> Deserialize<'de> for OptionEntry {
                     wildcard: Some(Box::new(DecisionSpec {
                         node: DecisionNode::Conditional(Box::new(cond)),
                         force: false,
+                        is_pattern: false,
                     })),
                 }),
+                check_file: None,
             }),
             Raw::Full {
                 decision,
@@ -362,12 +405,14 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 aliases,
                 allow_expansions,
                 values,
+                check_file,
             } => Ok(OptionEntry {
                 decision,
                 force,
                 aliases,
                 allow_expansions,
                 values,
+                check_file,
             }),
         }
     }
@@ -377,12 +422,105 @@ impl<'de> Deserialize<'de> for OptionEntry {
 // Positional rules — keyed by count ("1", "2", "*").
 // ---------------------------------------------------------------------------
 
+/// A single positional rule. Accepts either the historical bare-decision
+/// shapes (string `"allow"`, conditional `{"if":...}`, or `{"decision":...}`)
+/// or a richer object with `values` / `checkFile` overlays mirroring the
+/// option-entry shape.
+#[derive(Debug)]
+pub enum PositionalEntry {
+    /// Existing behavior: positional arg is judged solely by this
+    /// `DecisionNode`. Includes both static and conditional forms.
+    Bare(DecisionNode),
+    /// Rich form: the positional gets a base `decision` plus optional
+    /// `values` / `checkFile` overlays that match against the positional
+    /// arg's literal value (and, for `checkFile`, the file contents).
+    Rich {
+        decision: DecisionNode,
+        values: Option<WildcardMap<DecisionSpec>>,
+        check_file: Option<FileCheck>,
+    },
+}
+
+impl<'de> Deserialize<'de> for PositionalEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Use serde_json::Value for explicit dispatch rather than an inner
+        // untagged enum. The buffered Content deserializer that serde uses
+        // for nested untagged enums (PositionalDef → PositionalEntry → Raw)
+        // can silently mis-classify a 1-element array as a single object,
+        // so we peek the parsed value here and route by shape.
+        #[derive(Deserialize)]
+        struct RawRich {
+            decision: DecisionNode,
+            #[serde(default)]
+            values: Option<WildcardMap<DecisionSpec>>,
+            #[serde(default, rename = "checkFile")]
+            check_file: Option<FileCheck>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // Rich requires an object with `decision` plus at least one of
+        // `values` / `checkFile`. Without an overlay we collapse to Bare
+        // so the simple-case evaluator path stays unchanged.
+        if let serde_json::Value::Object(map) = &value {
+            let has_overlay = map.contains_key("values") || map.contains_key("checkFile");
+            if has_overlay && map.contains_key("decision") {
+                let rich: RawRich =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                return Ok(PositionalEntry::Rich {
+                    decision: rich.decision,
+                    values: rich.values,
+                    check_file: rich.check_file,
+                });
+            }
+        }
+
+        let node: DecisionNode = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(PositionalEntry::Bare(node))
+    }
+}
+
+impl PositionalEntry {
+    /// The base decision this entry resolves to before any `values` /
+    /// `checkFile` overlay contributions are merged in.
+    pub fn decision_node(&self) -> &DecisionNode {
+        match self {
+            PositionalEntry::Bare(n) => n,
+            PositionalEntry::Rich { decision, .. } => decision,
+        }
+    }
+}
+
 /// The value is either a single entry or an array of entries.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 pub enum PositionalDef {
-    Single(DecisionNode),
-    Array(Vec<DecisionNode>),
+    Single(PositionalEntry),
+    Array(Vec<PositionalEntry>),
+}
+
+impl<'de> Deserialize<'de> for PositionalDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Explicit array-vs-object dispatch via serde_json::Value.
+        // An untagged Single/Array enum here has been observed to misclassify
+        // a 1-element array as a Single, because the buffered Content
+        // deserializer can route a `[obj]` into a struct deserializer.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_array() {
+            let entries: Vec<PositionalEntry> =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(PositionalDef::Array(entries))
+        } else {
+            let entry: PositionalEntry =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(PositionalDef::Single(entry))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +699,214 @@ mod tests {
         .unwrap();
         assert!(matches!(spec.node, DecisionNode::Conditional(_)));
         assert!(spec.force);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_default_is_pattern_false() {
+        let spec: DecisionSpec = serde_json::from_str(r#""allow""#).unwrap();
+        assert!(!spec.is_pattern);
+
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","force":true}"#).unwrap();
+        assert!(!spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_is_pattern_true() {
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","isPattern":true}"#).unwrap();
+        assert!(matches!(spec.node, DecisionNode::Static(Decision::Deny)));
+        assert!(!spec.force);
+        assert!(spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_is_pattern_with_force() {
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","force":true,"isPattern":true}"#).unwrap();
+        assert!(spec.force);
+        assert!(spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_option_entry_with_check_file() {
+        let entry: OptionEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "checkFile": {
+                    "values": {
+                        "\\bsystem\\(": { "decision": "ask", "isPattern": true },
+                        "*": "allow"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let check = entry.check_file.expect("checkFile should be present");
+        assert_eq!(check.on_unreadable, Decision::Deny);
+        assert!(check.values.entries.contains_key("\\bsystem\\("));
+        assert!(check.values.wildcard().is_some());
+    }
+
+    #[test]
+    fn deserialize_check_file_on_unreadable_override() {
+        let entry: OptionEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "checkFile": {
+                    "values": { "*": "allow" },
+                    "onUnreadable": "ask"
+                }
+            }"#,
+        )
+        .unwrap();
+        let check = entry.check_file.expect("checkFile should be present");
+        assert_eq!(check.on_unreadable, Decision::Ask);
+    }
+
+    #[test]
+    fn deserialize_option_entry_without_check_file() {
+        let entry: OptionEntry =
+            serde_json::from_str(r#"{"decision":"allow","values":{"*":"allow"}}"#).unwrap();
+        assert!(entry.check_file.is_none());
+    }
+
+    #[test]
+    fn deserialize_positional_entry_bare_string() {
+        let entry: PositionalEntry = serde_json::from_str(r#""allow""#).unwrap();
+        assert!(matches!(
+            entry,
+            PositionalEntry::Bare(DecisionNode::Static(Decision::Allow))
+        ));
+    }
+
+    #[test]
+    fn deserialize_positional_entry_bare_conditional() {
+        let entry: PositionalEntry =
+            serde_json::from_str(r#"{"if":"readable","then":"allow","else":"deny"}"#).unwrap();
+        assert!(matches!(
+            entry,
+            PositionalEntry::Bare(DecisionNode::Conditional(_))
+        ));
+    }
+
+    #[test]
+    fn deserialize_positional_entry_object_decision_no_extras_is_bare() {
+        // {"decision": "..."} with no values/checkFile collapses to Bare so
+        // the simple-case path stays simple.
+        let entry: PositionalEntry = serde_json::from_str(r#"{"decision":"allow"}"#).unwrap();
+        assert!(matches!(
+            entry,
+            PositionalEntry::Bare(DecisionNode::Static(Decision::Allow))
+        ));
+    }
+
+    #[test]
+    fn deserialize_positional_entry_rich_with_values() {
+        let entry: PositionalEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "values": {
+                    "danger": { "decision": "deny", "isPattern": true },
+                    "*": "allow"
+                }
+            }"#,
+        )
+        .unwrap();
+        let PositionalEntry::Rich {
+            decision,
+            values,
+            check_file,
+        } = entry
+        else {
+            panic!("expected Rich");
+        };
+        assert!(matches!(decision, DecisionNode::Static(Decision::Allow)));
+        let values = values.expect("values present");
+        assert!(values.entries.contains_key("danger"));
+        assert!(values.wildcard().is_some());
+        assert!(check_file.is_none());
+    }
+
+    #[test]
+    fn deserialize_positional_entry_rich_with_check_file() {
+        let entry: PositionalEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "checkFile": {
+                    "values": { "*": "allow" },
+                    "onUnreadable": "ask"
+                }
+            }"#,
+        )
+        .unwrap();
+        let PositionalEntry::Rich {
+            check_file, values, ..
+        } = entry
+        else {
+            panic!("expected Rich");
+        };
+        assert!(values.is_none());
+        let check = check_file.expect("checkFile present");
+        assert_eq!(check.on_unreadable, Decision::Ask);
+    }
+
+    #[test]
+    fn deserialize_positional_def_single_rich() {
+        // Direct PositionalDef parse: a single rich entry (not an array).
+        let def: PositionalDef = serde_json::from_str(
+            r#"{ "decision": "allow", "values": { "x": "deny", "*": "allow" } }"#,
+        )
+        .unwrap();
+        match def {
+            PositionalDef::Single(PositionalEntry::Rich { values, .. }) => {
+                assert!(values.is_some(), "values should be Some on Rich");
+            }
+            other => panic!("expected Single(Rich), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_positional_def_array_of_rich() {
+        // Direct PositionalDef parse: array with a rich entry — this is the
+        // shape that the in-evaluator test uses, and that we want to confirm
+        // round-trips through PositionalDef → PositionalEntry without losing
+        // the `values` overlay.
+        let def: PositionalDef = serde_json::from_str(
+            r#"[ { "decision": "allow", "values": { "x": "deny", "*": "allow" } } ]"#,
+        )
+        .unwrap();
+        let entries = match def {
+            PositionalDef::Array(v) => v,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            PositionalEntry::Rich { values, .. } => {
+                assert!(values.is_some(), "values should be Some on array's Rich");
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_positional_def_array_of_mixed_entries() {
+        let def: PositionalDef = serde_json::from_str(
+            r#"[
+                "allow",
+                { "if": "readable", "then": "allow", "else": "deny" },
+                { "decision": "allow", "values": { "*": "allow" } }
+            ]"#,
+        )
+        .unwrap();
+        let entries = match def {
+            PositionalDef::Array(v) => v,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0], PositionalEntry::Bare(_)));
+        assert!(matches!(entries[1], PositionalEntry::Bare(_)));
+        assert!(matches!(entries[2], PositionalEntry::Rich { .. }));
     }
 
     #[test]

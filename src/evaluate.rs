@@ -1,11 +1,23 @@
+use regex::Regex;
+
 use crate::{
     bash::ExtractedCommand,
     decision::{stricter, Decision, DecisionNode, EvalResult, PathCheck},
+    path::{self, CompiledFileAccess, FileCheckRead, FILE_CHECK_MAX_BYTES},
     rules::{
-        lookup_with_alias, BashRules, CommandNode, FlagEntry, FlagKind, OptionEntry, PositionalDef,
-        WildcardMap,
+        lookup_with_alias, BashRules, CommandNode, DecisionSpec, FileCheck, FlagEntry, FlagKind,
+        OptionEntry, PositionalDef, PositionalEntry, WildcardMap,
     },
 };
+
+/// Per-evaluation context that flows unchanged through the recursive call
+/// graph: everything path-resolution code needs (the compiled file-access
+/// rules and the hook's working directory). Bundled so eval helpers don't
+/// accumulate parameter pairs at every signature.
+pub struct EvalCtx<'a> {
+    pub fa: &'a CompiledFileAccess,
+    pub cwd: &'a str,
+}
 
 /// A decision paired with the reason it was made.
 #[derive(Clone)]
@@ -236,7 +248,7 @@ pub fn evaluate_command(
     has_non_literal: bool,
     force_allow: bool,
     rules: &BashRules,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
 ) -> EvalResult {
     if force_allow {
         return EvalResult::Decided {
@@ -284,7 +296,7 @@ pub fn evaluate_command(
             node,
             &original,
             &format!("command '{cmd}'"),
-            cwd,
+            eval_ctx,
         ),
     }
 }
@@ -304,7 +316,7 @@ fn evaluate_node(
     node: &CommandNode,
     original_cmd: &str,
     matched_rule: &str,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
 ) -> EvalResult {
     let cmd_str = original_cmd;
 
@@ -318,7 +330,7 @@ fn evaluate_node(
             if let Some(subcmd_node) = subcmds.entries.get(subcmd_name.as_str()) {
                 // Collect pre-subcmd flag/option decisions.
                 let (pre_judgments, pre_path_checks) =
-                    collect_pre_subcmd_decisions(args, idx, node, original_cmd);
+                    collect_pre_subcmd_decisions(args, idx, node, original_cmd, eval_ctx);
 
                 // Build remaining args: [cmd_name] + args after subcmd.
                 let mut remaining_args = vec![args[0].clone()];
@@ -333,7 +345,7 @@ fn evaluate_node(
                     subcmd_node,
                     original_cmd,
                     &format!("subcmd '{subcmd_name}'"),
-                    cwd,
+                    eval_ctx,
                 );
 
                 if pre_judgments.is_empty() && pre_path_checks.is_empty() {
@@ -418,6 +430,7 @@ fn evaluate_node(
                     arg,
                     cmd_str,
                     &pos_args,
+                    eval_ctx,
                     &mut judgments,
                     &mut path_checks,
                 );
@@ -443,17 +456,19 @@ fn evaluate_node(
                         &args[i],
                         value,
                         cmd_str,
+                        eval_ctx,
                         &mut judgments,
                         &mut path_checks,
                     );
                 } else if let Some((name, eq_value)) = split_option_eq(&args[i]) {
                     if let Some(entry) = lookup_with_alias(name, options) {
-                        // Equals form: --output=/tmp/file
+                        // Equals form: --option=value
                         evaluate_option_value(
                             entry,
                             name,
                             eq_value,
                             cmd_str,
+                            eval_ctx,
                             &mut judgments,
                             &mut path_checks,
                         );
@@ -475,7 +490,7 @@ fn evaluate_node(
     // Positional (ordered, keyed by count)
     let (positional_judgments, positional_path_checks) = if let Some(positional) = &node.positional
     {
-        collect_positional_decisions(positional, &pos_args, cmd_str, "positional")
+        collect_positional_decisions(positional, &pos_args, cmd_str, eval_ctx, "positional")
     } else {
         (Vec::new(), Vec::new())
     };
@@ -485,7 +500,7 @@ fn evaluate_node(
     if let Some(cwd_node) = &node.cwd_check {
         classify_positional_entry(
             cwd_node,
-            cwd,
+            eval_ctx.cwd,
             cmd_str,
             "cwdCheck",
             &mut judgments,
@@ -532,6 +547,7 @@ fn collect_flag_decisions(
     arg: &str,
     cmd_str: &str,
     pos_args: &[Positional],
+    eval_ctx: &EvalCtx,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
@@ -545,9 +561,57 @@ fn collect_flag_decisions(
         }
         FlagKind::Positional(pos_defs) => {
             let context = format!("flag '{arg}' positional");
-            let (pj, pc) = collect_positional_decisions(pos_defs, pos_args, cmd_str, &context);
+            let (pj, pc) =
+                collect_positional_decisions(pos_defs, pos_args, cmd_str, eval_ctx, &context);
             judgments.extend(pj);
             path_checks.extend(pc);
+        }
+    }
+}
+
+/// Evaluate a positional arg against a `PositionalEntry`. The base
+/// `DecisionNode` is classified the same way as before; if the entry is
+/// the `Rich` form, any `values` overlay is matched against the arg
+/// value and any `checkFile` overlay is matched against file contents.
+/// Each overlay match contributes a separate judgment / path check; the
+/// caller merges them.
+fn evaluate_positional_entry(
+    entry: &PositionalEntry,
+    path_val: &str,
+    cmd_str: &str,
+    eval_ctx: &EvalCtx,
+    context: &str,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    classify_positional_entry(
+        entry.decision_node(),
+        path_val,
+        cmd_str,
+        context,
+        judgments,
+        path_checks,
+    );
+
+    if let PositionalEntry::Rich {
+        values, check_file, ..
+    } = entry
+    {
+        if let Some(values) = values {
+            let label = format!("{} arg", context);
+            lookup_value_in_map(values, path_val, cmd_str, &label, judgments, path_checks);
+        }
+        if let Some(check) = check_file {
+            let label = format!("{} arg", context);
+            evaluate_check_file(
+                check,
+                path_val,
+                cmd_str,
+                &label,
+                eval_ctx,
+                judgments,
+                path_checks,
+            );
         }
     }
 }
@@ -589,6 +653,7 @@ fn collect_positional_decisions(
     pos_defs: &WildcardMap<PositionalDef>,
     pos_args: &[Positional],
     cmd_str: &str,
+    eval_ctx: &EvalCtx,
     context: &str,
 ) -> (Vec<Judgment>, Vec<PathCheck>) {
     let mut judgments = Vec::new();
@@ -604,10 +669,11 @@ fn collect_positional_decisions(
         Some(PositionalDef::Array(entries)) => {
             for (i, entry) in entries.iter().enumerate() {
                 let path_val = pos_args.get(i).map(|p| p.value.as_str()).unwrap_or("");
-                classify_positional_entry(
+                evaluate_positional_entry(
                     entry,
                     path_val,
                     cmd_str,
+                    eval_ctx,
                     context,
                     &mut judgments,
                     &mut path_checks,
@@ -621,10 +687,11 @@ fn collect_positional_decisions(
                 &pos_args[..1.min(pos_args.len())]
             };
             for pos in targets {
-                classify_positional_entry(
+                evaluate_positional_entry(
                     entry,
                     &pos.value,
                     cmd_str,
+                    eval_ctx,
                     context,
                     &mut judgments,
                     &mut path_checks,
@@ -645,60 +712,21 @@ fn collect_positional_decisions(
     (judgments, path_checks)
 }
 
-/// Evaluate an option entry's value, pushing either a `Judgment` or `PathCheck`.
+/// Evaluate an option entry's value, pushing one or more `Judgment`s /
+/// `PathCheck`s. Runs the value-based lookup first, then (if `checkFile`
+/// is set) reads the referenced file and runs `checkFile.values` against
+/// the file contents.
 fn evaluate_option_value(
     entry: &OptionEntry,
     option_name: &str,
     value: &str,
     cmd_str: &str,
+    eval_ctx: &EvalCtx,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
     if let Some(values) = &entry.values {
-        let (spec, is_wildcard) = match values.entries.get(value) {
-            Some(s) => (Some(s), false),
-            None => (values.wildcard(), true),
-        };
-        if let Some(spec) = spec {
-            match &spec.node {
-                DecisionNode::Static(d) => {
-                    let reason = if is_wildcard {
-                        format!(
-                            "'{}': option '{}' value '{}' matched wildcard",
-                            cmd_str, option_name, value
-                        )
-                    } else {
-                        format!(
-                            "'{}': option '{}' value '{}' {}",
-                            cmd_str,
-                            option_name,
-                            value,
-                            d.description()
-                        )
-                    };
-                    judgments.push(Judgment {
-                        decision: *d,
-                        force: spec.force,
-                        reason,
-                    });
-                }
-                DecisionNode::Conditional(_) => {
-                    path_checks.push(PathCheck {
-                        path: value.to_string(),
-                        decision: spec.node.clone(),
-                        force: spec.force,
-                    });
-                }
-            }
-        } else {
-            judgments.push(Judgment::new(
-                Decision::Ask,
-                format!(
-                    "'{}': option '{}' value '{}' not in allowed list",
-                    cmd_str, option_name, value
-                ),
-            ));
-        }
+        lookup_value_in_map(values, value, cmd_str, option_name, judgments, path_checks);
     } else {
         judgments.push(Judgment {
             decision: entry.decision,
@@ -711,6 +739,212 @@ fn evaluate_option_value(
             ),
         });
     }
+
+    if let Some(check) = &entry.check_file {
+        evaluate_check_file(
+            check,
+            value,
+            cmd_str,
+            option_name,
+            eval_ctx,
+            judgments,
+            path_checks,
+        );
+    }
+}
+
+/// Read the file at `value` (gated by file-access globs and the size cap)
+/// and run `check.values` against its contents using the same lookup
+/// machinery as a normal value lookup. Read failures emit a single
+/// `check.on_unreadable` judgment with a reason describing the failure.
+fn evaluate_check_file(
+    check: &FileCheck,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    eval_ctx: &EvalCtx,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    let cwd_path = std::path::Path::new(eval_ctx.cwd);
+    let read_result = match path::read_for_check(value, eval_ctx.fa, cwd_path, FILE_CHECK_MAX_BYTES)
+    {
+        Ok(r) => r,
+        Err(err) => {
+            judgments.push(Judgment::new(
+                check.on_unreadable,
+                format!(
+                    "'{}': option '{}' checkFile path error on '{}': {}",
+                    cmd_str, option_name, value, err
+                ),
+            ));
+            return;
+        }
+    };
+
+    match read_result {
+        FileCheckRead::Unreadable(reason) => {
+            judgments.push(Judgment::new(
+                check.on_unreadable,
+                format!(
+                    "'{}': option '{}' checkFile unreadable: {}",
+                    cmd_str, option_name, reason
+                ),
+            ));
+        }
+        FileCheckRead::Contents(contents) => {
+            // Re-use the same exact/pattern/wildcard machinery as value
+            // lookup, but matched against file contents. The option_name
+            // is annotated so the reason makes the source obvious.
+            let context = format!("{} (file contents)", option_name);
+            lookup_value_in_map(
+                &check.values,
+                &contents,
+                cmd_str,
+                &context,
+                judgments,
+                path_checks,
+            );
+        }
+    }
+}
+
+/// Resolve a value against a `WildcardMap<DecisionSpec>` (option `values`,
+/// positional `values`, or `checkFile.values`). Emits one judgment or
+/// `PathCheck` per matching entry, then falls back to the wildcard only if
+/// nothing matched.
+///
+/// Lookup order:
+///   1. Exact key match — but only if the matched entry is *not* an
+///      `isPattern` entry (pattern entries' keys are regexes, not literal
+///      strings to be looked up by equality).
+///   2. Every `isPattern: true` entry whose compiled regex matches the value
+///      contributes a decision. Multiple matches are allowed; merging is done
+///      by the caller via `merge_judgments`.
+///   3. Wildcard `*` fires only when nothing in (1)+(2) matched.
+///
+/// A malformed regex pattern surfaces as a deny judgment with the parse
+/// error in the reason; this prevents a bad rule from accidentally allowing
+/// anything by short-circuiting the wildcard.
+fn lookup_value_in_map(
+    values: &WildcardMap<DecisionSpec>,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    let mut matched = false;
+
+    if let Some(spec) = values.entries.get(value) {
+        if !spec.is_pattern {
+            emit_value_spec(
+                spec,
+                value,
+                cmd_str,
+                option_name,
+                ValueMatch::Exact,
+                judgments,
+                path_checks,
+            );
+            matched = true;
+        }
+    }
+
+    for (key, spec) in &values.entries {
+        if !spec.is_pattern {
+            continue;
+        }
+        match Regex::new(key) {
+            Ok(re) => {
+                if re.is_match(value) {
+                    emit_value_spec(
+                        spec,
+                        value,
+                        cmd_str,
+                        option_name,
+                        ValueMatch::Pattern(key),
+                        judgments,
+                        path_checks,
+                    );
+                    matched = true;
+                }
+            }
+            Err(err) => {
+                judgments.push(Judgment::new(
+                    Decision::Deny,
+                    format!(
+                        "'{}': option '{}' has invalid regex pattern '{}': {}",
+                        cmd_str, option_name, key, err
+                    ),
+                ));
+                matched = true;
+            }
+        }
+    }
+
+    if !matched {
+        if let Some(spec) = values.wildcard() {
+            emit_value_spec(
+                spec,
+                value,
+                cmd_str,
+                option_name,
+                ValueMatch::Wildcard,
+                judgments,
+                path_checks,
+            );
+        } else {
+            judgments.push(Judgment::new(
+                Decision::Ask,
+                format!(
+                    "'{}': option '{}' value '{}' not in allowed list",
+                    cmd_str, option_name, value
+                ),
+            ));
+        }
+    }
+}
+
+enum ValueMatch<'a> {
+    Exact,
+    Pattern(&'a str),
+    Wildcard,
+}
+
+fn emit_value_spec(
+    spec: &DecisionSpec,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    kind: ValueMatch,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    match &spec.node {
+        DecisionNode::Static(d) => {
+            let suffix = match kind {
+                ValueMatch::Exact => d.description().to_string(),
+                ValueMatch::Pattern(key) => format!("matched pattern '{}'", key),
+                ValueMatch::Wildcard => "matched wildcard".to_string(),
+            };
+            judgments.push(Judgment {
+                decision: *d,
+                force: spec.force,
+                reason: format!(
+                    "'{}': option '{}' value '{}' {}",
+                    cmd_str, option_name, value, suffix
+                ),
+            });
+        }
+        DecisionNode::Conditional(_) => {
+            path_checks.push(PathCheck {
+                path: value.to_string(),
+                decision: spec.node.clone(),
+                force: spec.force,
+            });
+        }
+    }
 }
 
 /// Collect flag/option decisions from args between the command name and the subcmd.
@@ -719,6 +953,7 @@ fn collect_pre_subcmd_decisions(
     subcmd_idx: usize,
     node: &CommandNode,
     original_cmd: &str,
+    eval_ctx: &EvalCtx,
 ) -> (Vec<Judgment>, Vec<PathCheck>) {
     let cmd_str = original_cmd;
     let mut judgments = Vec::new();
@@ -737,7 +972,15 @@ fn collect_pre_subcmd_decisions(
             if let Some(entry) = lookup_with_alias(arg, options) {
                 // Space-separated form: --option value
                 let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-                evaluate_option_value(entry, arg, value, cmd_str, &mut judgments, &mut path_checks);
+                evaluate_option_value(
+                    entry,
+                    arg,
+                    value,
+                    cmd_str,
+                    eval_ctx,
+                    &mut judgments,
+                    &mut path_checks,
+                );
                 found = true;
                 i += 1; // skip the option's value
             } else if let Some((name, eq_value)) = split_option_eq(arg) {
@@ -748,6 +991,7 @@ fn collect_pre_subcmd_decisions(
                         name,
                         eq_value,
                         cmd_str,
+                        eval_ctx,
                         &mut judgments,
                         &mut path_checks,
                     );
@@ -839,6 +1083,12 @@ mod tests {
         rules.tools.bash.as_ref().expect("Bash rules should exist")
     }
 
+    fn test_fa() -> CompiledFileAccess {
+        let rules = test_rules();
+        CompiledFileAccess::compile(&rules.file_access, std::path::Path::new(TEST_CWD), None)
+            .expect("compile file access")
+    }
+
     /// Helper: build args and uniform expansion_flags (all literal).
     fn args(strs: &[&str]) -> (Vec<String>, Vec<bool>) {
         let a: Vec<String> = strs.iter().map(|s| s.to_string()).collect();
@@ -853,7 +1103,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(strs);
-        evaluate_command(&a, &e, false, false, bash, TEST_CWD)
+        evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        )
     }
 
     /// Helper: extract decision from EvalResult.
@@ -870,7 +1130,17 @@ mod tests {
     fn empty_args_ask() {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
-        let result = evaluate_command(&[], &[], false, false, bash, TEST_CWD);
+        let result = evaluate_command(
+            &[],
+            &[],
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -912,7 +1182,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["anything"]);
-        let result = evaluate_command(&a, &e, false, true, bash, TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            true,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1040,6 +1320,310 @@ mod tests {
         assert_eq!(decision(&result), Decision::Deny);
     }
 
+    // --- isPattern in option values ---
+
+    fn eval_with_commands(commands_json: &str, strs: &[&str]) -> EvalResult {
+        let commands: std::collections::HashMap<String, CommandNode> =
+            serde_json::from_str(commands_json).expect("commands");
+        let bash = BashRules {
+            commands,
+            globally_allowed_flags: vec![],
+        };
+        let (a, e) = args(strs);
+        evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            &bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        )
+    }
+
+    #[test]
+    fn option_value_pattern_match() {
+        // pattern key `^foo` matches value "foobar" → deny
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_no_match_falls_to_wildcard() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "bar"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn option_value_exact_and_pattern_both_apply() {
+        // exact match "foo" → allow; pattern `^f` also matches → ask.
+        // Strictest of the two wins (ask).
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": "allow",
+                            "^f": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foo"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn option_value_multiple_patterns_match_strictest_wins() {
+        // two patterns both match; deny beats ask.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": { "decision": "ask", "isPattern": true },
+                            "bar": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_match_suppresses_wildcard() {
+        // when a pattern matches, the wildcard does NOT also fire.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "allow", "isPattern": true },
+                            "*": "deny"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn option_value_invalid_regex_pattern_denies() {
+        // a malformed regex must not silently fall through to allow; it
+        // produces a deny judgment with a clear reason.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "[unclosed": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "anything"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_with_force() {
+        // a forced pattern decision should win over a non-forced exact
+        // decision via merge_judgments' force handling.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": "deny",
+                            "^f": { "decision": "allow", "isPattern": true, "force": true }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foo"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    // --- checkFile on options ---
+    //
+    // Only the pure-CPU branches of checkFile evaluation live here: paths
+    // blocked by read globs (no filesystem access) and the `onUnreadable`
+    // fallback override. Successful reads and pattern matches against file
+    // contents are covered end-to-end by integration tests that run the
+    // real binary against real on-disk script files.
+
+    #[test]
+    fn check_file_unreadable_defaults_to_deny() {
+        // path is blocked by the test_fa's `!**/*.secret*` read denylist.
+        // No filesystem access; on_unreadable defaults to deny.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "-f": {
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "-f", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn check_file_unreadable_with_on_unreadable_ask() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "-f": {
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" },
+                            "onUnreadable": "ask"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "-f", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    // --- Rich positional entries (values + checkFile on positionals) ---
+
+    #[test]
+    fn positional_rich_values_pattern_match() {
+        // The bare script-as-positional case: a regex pattern in the
+        // positional's `values` matches a `system(` call in the script
+        // text and forces an ask judgment.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": [{
+                        "decision": "allow",
+                        "values": {
+                            "\\bsystem\\(": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "BEGIN{system(\"rm -rf /\")}"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn positional_rich_values_no_match_falls_through() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": [{
+                        "decision": "allow",
+                        "values": {
+                            "\\bsystem\\(": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "{print $1}"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn positional_rich_check_file_unreadable_uses_on_unreadable() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "*": [{
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" },
+                            "onUnreadable": "ask"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn positional_bare_form_still_works() {
+        // Sanity check: existing bare-decision positional entries are
+        // unaffected by the new richer shape.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": ["deny"]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "anything"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
     // --- Pre-subcmd flags/options ---
 
     #[test]
@@ -1140,7 +1724,17 @@ mod tests {
         // ls has no allow_expansions — expansion in arg is uncovered
         let a: Vec<String> = vec!["ls".into(), "".into()];
         let e = vec![false, true]; // second arg is non-literal
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -1151,7 +1745,17 @@ mod tests {
         // env has allowExpansions: true at node level
         let a: Vec<String> = vec!["env".into(), "".into()];
         let e = vec![false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1167,7 +1771,17 @@ mod tests {
             "".into(), // expansion in value position
         ];
         let e = vec![false, false, false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1435,7 +2049,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp/project");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp/project",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 // Should have path checks for: positional (archive readable) + cwdCheck (cwd writable)
@@ -1471,7 +2095,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "-l", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp/project");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp/project",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(path_checks.iter().any(|pc| pc.path == "/tmp/project"));
@@ -1527,7 +2161,17 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // curl --output=/tmp/file should produce a path check for /tmp/file
         let (a, e) = args(&["curl", "--request", "GET", "--output=/tmp/file"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(
@@ -1545,7 +2189,17 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // sort --output=/tmp/file should NOT be an unknown flag
         let (a, e) = args(&["sort", "--output=/tmp/sorted.txt", "input.txt"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp",
+            },
+        );
         match &result {
             EvalResult::Decided { reason, .. } => {
                 assert!(

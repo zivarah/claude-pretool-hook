@@ -302,7 +302,12 @@ Full-object fields:
   shape: `{"decision": ..., "force": true}`.
 - `allowExpansions` -- see [Expansion handling](#expansion-handling).
 - `values` -- per-value rules (decision string, conditional, or full
-  spec with `force`). Wildcard `*` falls through to "ask" when absent.
+  spec with `force` / `isPattern`). See [Value lookup and
+  isPattern](#value-lookup-and-ispattern). Wildcard `*` falls through to
+  "ask" when absent.
+- `checkFile` -- treat the value as a path and run a second
+  `values`-shaped lookup against the contents of that file. See
+  [`checkFile`](#checkfile).
 
 Both space-separated (`--output /tmp/file`) and equals-separated
 (`--output=/tmp/file`) forms are recognized. For the equals form, the
@@ -312,8 +317,8 @@ normally (including alias matching).
 ### Positional def
 
 Keyed by argument count (`"1"`, `"2"`, etc.) or `"*"` for any count. Values
-are either a single decision node (applied uniformly) or an array (one rule
-per position):
+are either a single entry (applied uniformly) or an array (one rule per
+position):
 
 ```json
 "positional": {
@@ -327,6 +332,86 @@ per position):
 
 When a `"*"` wildcard matches and the def is a single entry (not an array),
 the rule applies to **all** positional args.
+
+Each entry can also use the richer object form to attach `values` and/or
+`checkFile` overlays to the positional, mirroring an option entry:
+
+```json
+"positional": {
+  "*": {
+    "decision": "allow",
+    "values": {
+      "*": "allow",
+      "\\bsystem\\(": { "decision": "ask", "isPattern": true }
+    }
+  }
+}
+```
+
+The base `decision` is classified as before. When `values` is present, the
+positional arg's literal text is run through the same lookup as
+[Value lookup and isPattern](#value-lookup-and-ispattern). When
+`checkFile` is present, the positional is treated as a path and the file
+contents are scanned the same way -- useful for `awk 'script' file` where
+the first positional is the script.
+
+### Value lookup and `isPattern`
+
+A `values` dict resolves a value against three kinds of entry, with results
+merged through the normal "strictest wins" path:
+
+1. **Exact match** -- a non-`isPattern` entry whose key equals the value.
+2. **Regex match** -- any entry marked `isPattern: true` whose key, compiled
+   as a regex (Rust `regex` crate syntax), matches the value. Multiple
+   patterns may match; each contributes a judgment.
+3. **Wildcard `*`** -- fires only when neither (1) nor (2) matched.
+
+Pattern entries must use the object form so the marker is explicit; bare
+strings (`"foo": "allow"`) are always exact-match.
+
+```json
+"-e": {
+  "decision": "allow",
+  "values": {
+    "*": "allow",
+    "\\bsystem\\(": { "decision": "ask", "isPattern": true }
+  }
+}
+```
+
+A malformed regex emits a deny judgment with the parse error in the reason,
+so a broken pattern cannot silently fall through to the wildcard.
+
+`isPattern` is only valid inside value-context dicts (`values` on options
+and positionals, and `checkFile.values`). The type system prevents it from
+appearing on command-, flag-, or bare-positional decisions.
+
+### `checkFile`
+
+`checkFile` on an option (or rich positional entry) reads the file the
+value refers to and matches its **contents** against an inner `values`
+dict using the same exact / `isPattern` / `*` rules:
+
+```json
+"-f": {
+  "decision": "allow",
+  "values": {
+    "*": { "if": "readable", "then": "allow", "else": "deny" }
+  },
+  "checkFile": {
+    "onUnreadable": "deny",
+    "values": {
+      "*": "allow",
+      "\\bsystem\\(": { "decision": "ask", "isPattern": true }
+    }
+  }
+}
+```
+
+The path goes through the existing read-globs gate before the file is
+opened; failures (blocked by globs, missing, oversized, not valid UTF-8,
+generic I/O error) all resolve to the `onUnreadable` decision (default
+`deny`). Files are capped at 1 MiB.
 
 ### Decision node (conditional)
 
