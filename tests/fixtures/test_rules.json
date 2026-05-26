@@ -61,6 +61,25 @@
               "decision": "allow",
               "values": {
                 "*": { "if": "readable", "then": "allow", "else": "deny" }
+              },
+              "checkFile": {
+                "values": {
+                  "*": "allow",
+                  "\\bsystem\\s*\\(": { "decision": "ask", "isPattern": true },
+                  "\\bgetline\\b[^;{}]*[|<]": { "decision": "ask", "isPattern": true },
+                  "\\bprintf?\\b[^;{}]*(>|\\|)": { "decision": "ask", "isPattern": true }
+                }
+              }
+            }
+          },
+          "positional": {
+            "*": {
+              "decision": "allow",
+              "values": {
+                "*": "allow",
+                "\\bsystem\\s*\\(": { "decision": "ask", "isPattern": true },
+                "\\bgetline\\b[^;{}]*[|<]": { "decision": "ask", "isPattern": true },
+                "\\bprintf?\\b[^;{}]*(>|\\|)": { "decision": "ask", "isPattern": true }
               }
             }
           }
@@ -204,7 +223,9 @@
               "decision": "allow",
               "aliases": ["--expression"],
               "values": {
-                "*": "allow"
+                "*": "allow",
+                "(^|[;}\\n])\\s*\\d*,?\\d*\\s*[eEwWrR]([\\s/]|$)": { "decision": "ask", "isPattern": true },
+                "s/[^/]+/[^/]+/[a-z]*[ew]": { "decision": "ask", "isPattern": true }
               }
             },
             "-f": {
@@ -216,22 +237,25 @@
                   "then": "allow",
                   "else": "deny"
                 }
+              },
+              "checkFile": {
+                "values": {
+                  "*": "allow",
+                  "(^|[;}\\n])\\s*\\d*,?\\d*\\s*[eEwWrR]([\\s/]|$)": { "decision": "ask", "isPattern": true },
+                  "s/[^/]+/[^/]+/[a-z]*[ew]": { "decision": "ask", "isPattern": true }
+                }
               }
             }
           },
           "positional": {
-            "*": "allow",
-            "1": [
-              {
-                "if": "writable",
-                "then": "allow",
-                "else": {
-                  "if": "readable",
-                  "then": "ask",
-                  "else": "deny"
-                }
+            "*": {
+              "decision": "allow",
+              "values": {
+                "*": "allow",
+                "(^|[;}\\n])\\s*\\d*,?\\d*\\s*[eEwWrR]([\\s/]|$)": { "decision": "ask", "isPattern": true },
+                "s/[^/]+/[^/]+/[a-z]*[ew]": { "decision": "ask", "isPattern": true }
               }
-            ]
+            }
           }
         },
 

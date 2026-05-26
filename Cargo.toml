@@ -17,3 +17,4 @@ tree-sitter-bash = "0.23"
 
 [dev-dependencies]
 duct = "0.13"
+tempfile = "3"

@@ -842,8 +842,19 @@ fn bash_shfmt_write_not_writable() {
 // to nothing is a no-op.
 
 // =============================================================================
-// Bash tool — awk -f readable check
+// Bash tool — awk -f (path gating + checkFile unreadable fallback)
 // =============================================================================
+
+/// Writes `contents` to a `NamedTempFile` and returns it. The file is
+/// auto-deleted when the returned handle is dropped, so tests just need
+/// to keep the binding alive for the duration of the assertion.
+fn write_tmp_file(contents: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().expect("create tmp file");
+    file.write_all(contents.as_bytes()).expect("write tmp file");
+    file.flush().expect("flush tmp file");
+    file
+}
 
 #[test]
 fn bash_awk_no_file_allowed() {
@@ -851,18 +862,128 @@ fn bash_awk_no_file_allowed() {
 }
 
 #[test]
-fn bash_awk_file_readable() {
-    assert_decision(&bash_input("awk -f /tmp/script.awk /tmp/data.txt"), "allow");
-}
-
-#[test]
-fn bash_awk_file_not_readable() {
-    // /tmp/app.secret is denied by read patterns → deny
+fn bash_awk_f_blocked_path_denies() {
+    // /tmp/app.secret is denied by read patterns → checkFile reports
+    // unreadable and the default `onUnreadable: deny` applies. The file
+    // doesn't need to exist; the read-globs gate runs before any I/O.
     assert_decision(&bash_input("awk -f /tmp/app.secret /tmp/data.txt"), "deny");
 }
 
-// NOTE: awk can still write files via print>"file" and execute commands
-// via system() inside scripts. These are opaque to the hook.
+#[test]
+fn bash_awk_f_missing_file_denies() {
+    // path passes the read-globs gate but doesn't exist on disk →
+    // onUnreadable defaults to deny.
+    assert_decision(
+        &bash_input("awk -f /tmp/cph-it-nonexistent-xyz.awk /tmp/data.txt"),
+        "deny",
+    );
+}
+
+// =============================================================================
+// Bash tool — sed/awk danger-pattern detection
+// =============================================================================
+
+// --- sed -e (option value patterns) ---
+
+#[test]
+fn bash_sed_e_safe_substitution_allow() {
+    assert_decision(&bash_input("sed -e 's/foo/bar/' /tmp/file.txt"), "allow");
+}
+
+#[test]
+fn bash_sed_e_exec_command_asks() {
+    // The `e` sed command executes the pattern space as a shell command.
+    assert_decision(
+        &bash_input("sed -e 'e cat /etc/passwd' /tmp/file.txt"),
+        "ask",
+    );
+}
+
+#[test]
+fn bash_sed_e_substitution_e_flag_asks() {
+    // s///e flag executes the substitution result as a shell command.
+    assert_decision(&bash_input("sed -e 's/foo/bar/e' /tmp/file.txt"), "ask");
+}
+
+#[test]
+fn bash_sed_e_write_command_asks() {
+    // The `w` sed command writes pattern space to a file (other than stdout).
+    assert_decision(&bash_input("sed -e '1w /etc/passwd' /tmp/file.txt"), "ask");
+}
+
+// --- sed positional script (no -e) ---
+
+#[test]
+fn bash_sed_positional_safe_script_allow() {
+    assert_decision(&bash_input("sed 's/foo/bar/' /tmp/file.txt"), "allow");
+}
+
+#[test]
+fn bash_sed_positional_exec_command_asks() {
+    assert_decision(&bash_input("sed '1e cat /etc/passwd' /tmp/file.txt"), "ask");
+}
+
+// --- sed -f (file-contents patterns) ---
+
+#[test]
+fn bash_sed_f_safe_script_file_allow() {
+    let tmp = write_tmp_file("s/foo/bar/");
+    let cmd = format!("sed -f {} /tmp/file.txt", tmp.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
+}
+
+#[test]
+fn bash_sed_f_evil_script_file_asks() {
+    let tmp = write_tmp_file("1e rm -rf /\ns/a/b/");
+    let cmd = format!("sed -f {} /tmp/file.txt", tmp.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
+}
+
+// --- awk -f (file-contents patterns) ---
+
+#[test]
+fn bash_awk_f_safe_script_file_allow() {
+    let tmp = write_tmp_file("{print $1}");
+    let cmd = format!("awk -f {} /tmp/data.txt", tmp.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
+}
+
+#[test]
+fn bash_awk_f_system_call_asks() {
+    let tmp = write_tmp_file("BEGIN{system(\"id\")}");
+    let cmd = format!("awk -f {} /tmp/data.txt", tmp.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
+}
+
+#[test]
+fn bash_awk_f_print_redirect_asks() {
+    let tmp = write_tmp_file("{print $1 > \"/tmp/out\"}");
+    let cmd = format!("awk -f {} /tmp/data.txt", tmp.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
+}
+
+// --- awk positional script ---
+
+#[test]
+fn bash_awk_positional_safe_script_allow() {
+    assert_decision(&bash_input("awk '{print $1}' /tmp/data.txt"), "allow");
+}
+
+#[test]
+fn bash_awk_positional_system_call_asks() {
+    assert_decision(
+        &bash_input("awk 'BEGIN{system(\"rm -rf /\")}' /tmp/data.txt"),
+        "ask",
+    );
+}
+
+#[test]
+fn bash_awk_positional_print_redirect_asks() {
+    assert_decision(
+        &bash_input("awk '{print > \"/tmp/x\"}' /tmp/data.txt"),
+        "ask",
+    );
+}
 
 // =============================================================================
 // Bash tool — jq file-reading options
