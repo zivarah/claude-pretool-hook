@@ -136,6 +136,7 @@ dependencies = [
  "duct",
  "globset",
  "path-clean",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
