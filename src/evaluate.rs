@@ -1,9 +1,11 @@
+use regex::Regex;
+
 use crate::{
     bash::ExtractedCommand,
     decision::{stricter, Decision, DecisionNode, EvalResult, PathCheck},
     rules::{
-        lookup_with_alias, BashRules, CommandNode, FlagEntry, FlagKind, OptionEntry, PositionalDef,
-        WildcardMap,
+        lookup_with_alias, BashRules, CommandNode, DecisionSpec, FlagEntry, FlagKind, OptionEntry,
+        PositionalDef, WildcardMap,
     },
 };
 
@@ -654,52 +656,7 @@ fn evaluate_option_value(
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
-    if let Some(values) = &entry.values {
-        let (spec, is_wildcard) = match values.entries.get(value) {
-            Some(s) => (Some(s), false),
-            None => (values.wildcard(), true),
-        };
-        if let Some(spec) = spec {
-            match &spec.node {
-                DecisionNode::Static(d) => {
-                    let reason = if is_wildcard {
-                        format!(
-                            "'{}': option '{}' value '{}' matched wildcard",
-                            cmd_str, option_name, value
-                        )
-                    } else {
-                        format!(
-                            "'{}': option '{}' value '{}' {}",
-                            cmd_str,
-                            option_name,
-                            value,
-                            d.description()
-                        )
-                    };
-                    judgments.push(Judgment {
-                        decision: *d,
-                        force: spec.force,
-                        reason,
-                    });
-                }
-                DecisionNode::Conditional(_) => {
-                    path_checks.push(PathCheck {
-                        path: value.to_string(),
-                        decision: spec.node.clone(),
-                        force: spec.force,
-                    });
-                }
-            }
-        } else {
-            judgments.push(Judgment::new(
-                Decision::Ask,
-                format!(
-                    "'{}': option '{}' value '{}' not in allowed list",
-                    cmd_str, option_name, value
-                ),
-            ));
-        }
-    } else {
+    let Some(values) = &entry.values else {
         judgments.push(Judgment {
             decision: entry.decision,
             force: entry.force,
@@ -710,6 +667,146 @@ fn evaluate_option_value(
                 entry.decision.description()
             ),
         });
+        return;
+    };
+    lookup_value_in_map(values, value, cmd_str, option_name, judgments, path_checks);
+}
+
+/// Resolve a value against a `WildcardMap<DecisionSpec>` (option `values`,
+/// positional `values`, or `checkFile.values`). Emits one judgment or
+/// `PathCheck` per matching entry, then falls back to the wildcard only if
+/// nothing matched.
+///
+/// Lookup order:
+///   1. Exact key match — but only if the matched entry is *not* an
+///      `isPattern` entry (pattern entries' keys are regexes, not literal
+///      strings to be looked up by equality).
+///   2. Every `isPattern: true` entry whose compiled regex matches the value
+///      contributes a decision. Multiple matches are allowed; merging is done
+///      by the caller via `merge_judgments`.
+///   3. Wildcard `*` fires only when nothing in (1)+(2) matched.
+///
+/// A malformed regex pattern surfaces as a deny judgment with the parse
+/// error in the reason; this prevents a bad rule from accidentally allowing
+/// anything by short-circuiting the wildcard.
+fn lookup_value_in_map(
+    values: &WildcardMap<DecisionSpec>,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    let mut matched = false;
+
+    if let Some(spec) = values.entries.get(value) {
+        if !spec.is_pattern {
+            emit_value_spec(
+                spec,
+                value,
+                cmd_str,
+                option_name,
+                ValueMatch::Exact,
+                judgments,
+                path_checks,
+            );
+            matched = true;
+        }
+    }
+
+    for (key, spec) in &values.entries {
+        if !spec.is_pattern {
+            continue;
+        }
+        match Regex::new(key) {
+            Ok(re) => {
+                if re.is_match(value) {
+                    emit_value_spec(
+                        spec,
+                        value,
+                        cmd_str,
+                        option_name,
+                        ValueMatch::Pattern(key),
+                        judgments,
+                        path_checks,
+                    );
+                    matched = true;
+                }
+            }
+            Err(err) => {
+                judgments.push(Judgment::new(
+                    Decision::Deny,
+                    format!(
+                        "'{}': option '{}' has invalid regex pattern '{}': {}",
+                        cmd_str, option_name, key, err
+                    ),
+                ));
+                matched = true;
+            }
+        }
+    }
+
+    if !matched {
+        if let Some(spec) = values.wildcard() {
+            emit_value_spec(
+                spec,
+                value,
+                cmd_str,
+                option_name,
+                ValueMatch::Wildcard,
+                judgments,
+                path_checks,
+            );
+        } else {
+            judgments.push(Judgment::new(
+                Decision::Ask,
+                format!(
+                    "'{}': option '{}' value '{}' not in allowed list",
+                    cmd_str, option_name, value
+                ),
+            ));
+        }
+    }
+}
+
+enum ValueMatch<'a> {
+    Exact,
+    Pattern(&'a str),
+    Wildcard,
+}
+
+fn emit_value_spec(
+    spec: &DecisionSpec,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    kind: ValueMatch,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    match &spec.node {
+        DecisionNode::Static(d) => {
+            let suffix = match kind {
+                ValueMatch::Exact => d.description().to_string(),
+                ValueMatch::Pattern(key) => format!("matched pattern '{}'", key),
+                ValueMatch::Wildcard => "matched wildcard".to_string(),
+            };
+            judgments.push(Judgment {
+                decision: *d,
+                force: spec.force,
+                reason: format!(
+                    "'{}': option '{}' value '{}' {}",
+                    cmd_str, option_name, value, suffix
+                ),
+            });
+        }
+        DecisionNode::Conditional(_) => {
+            path_checks.push(PathCheck {
+                path: value.to_string(),
+                decision: spec.node.clone(),
+                force: spec.force,
+            });
+        }
     }
 }
 
@@ -1038,6 +1135,170 @@ mod tests {
         // rm has decision allow, but -r flag is deny → merged to deny
         let result = eval(&["rm", "-r", "/tmp/file.txt"]);
         assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    // --- isPattern in option values ---
+
+    fn eval_with_commands(commands_json: &str, strs: &[&str]) -> EvalResult {
+        let commands: std::collections::HashMap<String, CommandNode> =
+            serde_json::from_str(commands_json).expect("commands");
+        let bash = BashRules {
+            commands,
+            globally_allowed_flags: vec![],
+        };
+        let (a, e) = args(strs);
+        evaluate_command(&a, &e, false, false, &bash, TEST_CWD)
+    }
+
+    #[test]
+    fn option_value_pattern_match() {
+        // pattern key `^foo` matches value "foobar" → deny
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_no_match_falls_to_wildcard() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "bar"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn option_value_exact_and_pattern_both_apply() {
+        // exact match "foo" → allow; pattern `^f` also matches → ask.
+        // Strictest of the two wins (ask).
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": "allow",
+                            "^f": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foo"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn option_value_multiple_patterns_match_strictest_wins() {
+        // two patterns both match; deny beats ask.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": { "decision": "ask", "isPattern": true },
+                            "bar": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_match_suppresses_wildcard() {
+        // when a pattern matches, the wildcard does NOT also fire.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "^foo": { "decision": "allow", "isPattern": true },
+                            "*": "deny"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foobar"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn option_value_invalid_regex_pattern_denies() {
+        // a malformed regex must not silently fall through to allow; it
+        // produces a deny judgment with a clear reason.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "[unclosed": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "anything"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn option_value_pattern_with_force() {
+        // a forced pattern decision should win over a non-forced exact
+        // decision via merge_judgments' force handling.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "--script": {
+                        "decision": "allow",
+                        "values": {
+                            "foo": "deny",
+                            "^f": { "decision": "allow", "isPattern": true, "force": true }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "--script", "foo"]);
+        assert_eq!(decision(&result), Decision::Allow);
     }
 
     // --- Pre-subcmd flags/options ---
