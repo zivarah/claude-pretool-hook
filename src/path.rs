@@ -129,6 +129,79 @@ pub fn is_readable(filepath: &str, fa: &CompiledFileAccess, cwd: &Path) -> Resul
     fa.read.patterns.matches(filepath, cwd)
 }
 
+/// Result of attempting to read a file for a `checkFile` content scan.
+pub enum FileCheckRead {
+    /// File was successfully read. Contents are within the size cap and
+    /// valid UTF-8.
+    Contents(String),
+    /// File could not be read for any reason — blocked by read globs,
+    /// missing on disk, oversized, not valid UTF-8, or a generic I/O
+    /// error. The inner string is a short human-readable explanation
+    /// suitable for inclusion in an `onUnreadable` judgment's reason.
+    Unreadable(String),
+}
+
+/// Production default size cap for `read_for_check`. Files larger than
+/// this are reported as `Unreadable("...exceeds N byte limit")`. Tests
+/// pass a smaller cap to exercise the oversize path without writing a
+/// megabyte to disk.
+pub const FILE_CHECK_MAX_BYTES: usize = 1024 * 1024;
+
+/// Read a file's contents for `checkFile` evaluation. The path is first
+/// gated by `is_readable`, so a path blocked by the read globs is
+/// reported as unreadable without any filesystem access. On success the
+/// file's UTF-8 contents are returned, capped at `max_bytes`. Files
+/// exceeding the cap, missing on disk, not valid UTF-8, or hitting an
+/// I/O error all map to `Unreadable(...)` so the caller can emit a
+/// single `onUnreadable` judgment regardless of why the read failed.
+pub fn read_for_check(
+    filepath: &str,
+    fa: &CompiledFileAccess,
+    cwd: &Path,
+    max_bytes: usize,
+) -> Result<FileCheckRead, PathError> {
+    if !is_readable(filepath, fa, cwd)? {
+        return Ok(FileCheckRead::Unreadable(format!(
+            "path '{}' is not readable per file access rules",
+            filepath
+        )));
+    }
+
+    let normalized = normalize_path(filepath, cwd)?;
+    let file = match std::fs::File::open(&normalized) {
+        Ok(f) => f,
+        Err(err) => {
+            return Ok(FileCheckRead::Unreadable(format!(
+                "cannot open '{}': {}",
+                normalized, err
+            )));
+        }
+    };
+
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let to_read = (max_bytes as u64).saturating_add(1);
+    if let Err(err) = file.take(to_read).read_to_end(&mut buf) {
+        return Ok(FileCheckRead::Unreadable(format!(
+            "read error on '{}': {}",
+            normalized, err
+        )));
+    }
+    if buf.len() > max_bytes {
+        return Ok(FileCheckRead::Unreadable(format!(
+            "file '{}' exceeds {} byte limit",
+            normalized, max_bytes
+        )));
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => Ok(FileCheckRead::Contents(s)),
+        Err(_) => Ok(FileCheckRead::Unreadable(format!(
+            "file '{}' is not valid UTF-8",
+            normalized
+        ))),
+    }
+}
+
 /// Check if a path is writable according to compiled file access rules.
 /// When `require_readable` is set, a path must also pass the read globs.
 pub fn is_writable(filepath: &str, fa: &CompiledFileAccess, cwd: &Path) -> Result<bool, PathError> {
@@ -609,5 +682,23 @@ mod tests {
             resolve_conditional(&d, "/etc/.secret", &fa, &cwd()).unwrap(),
             Decision::Deny
         );
+    }
+
+    // --- read_for_check ---
+    //
+    // Pure-CPU branches only. The I/O paths (file present, oversized, not
+    // UTF-8, generic I/O error) are covered end-to-end by integration tests
+    // that run the real binary against a real `checkFile` rule.
+
+    #[test]
+    fn read_for_check_blocked_path_no_io() {
+        // path matches read denylist (!**/*.secret*); helper must NOT touch
+        // the filesystem and must return Unreadable.
+        let fa = test_file_access();
+        let result = read_for_check("/tmp/some.secret", &fa, &cwd(), 1024).unwrap();
+        match result {
+            FileCheckRead::Unreadable(msg) => assert!(msg.contains("not readable")),
+            FileCheckRead::Contents(_) => panic!("expected Unreadable"),
+        }
     }
 }
