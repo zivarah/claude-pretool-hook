@@ -616,7 +616,7 @@ fn collect_positional_decisions(
             for (i, entry) in entries.iter().enumerate() {
                 let path_val = pos_args.get(i).map(|p| p.value.as_str()).unwrap_or("");
                 classify_positional_entry(
-                    entry,
+                    entry.decision_node(),
                     path_val,
                     cmd_str,
                     context,
@@ -633,7 +633,7 @@ fn collect_positional_decisions(
             };
             for pos in targets {
                 classify_positional_entry(
-                    entry,
+                    entry.decision_node(),
                     &pos.value,
                     cmd_str,
                     context,

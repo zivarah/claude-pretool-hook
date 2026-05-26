@@ -174,10 +174,38 @@ let
     }
   );
 
-  # A positional entry is a conditional decision — either a bare string
-  # ("allow"), a conditional ({if, then, else}), or the wrapped
-  # form ({decision: ...}). The Rust deserializer handles all three.
-  positionalEntryType = conditionalDecisionType;
+  # A positional entry is either:
+  #   - the historical bare-decision shape (string, conditional, or
+  #     wrapped {decision: ...}), or
+  #   - a richer submodule with optional `values` / `checkFile` overlays
+  #     matched against the positional arg (and its file contents).
+  positionalEntryType = lib.types.either conditionalDecisionType (
+    lib.types.submodule {
+      options = {
+        decision = lib.mkOption {
+          type = conditionalDecisionType;
+          description = "Base decision for this positional entry.";
+        };
+        values = lib.mkOption {
+          type = lib.types.nullOr (lib.types.attrsOf valueEntryType);
+          default = null;
+          description = ''
+            Per-value decision overrides matched against the literal
+            positional arg, using the same exact / `isPattern: true` /
+            wildcard rules as option values.
+          '';
+        };
+        checkFile = lib.mkOption {
+          type = lib.types.nullOr fileCheckType;
+          default = null;
+          description = ''
+            Inspect the file referenced by this positional arg; the
+            file's contents are matched against `checkFile.values`.
+          '';
+        };
+      };
+    }
+  );
 
   positionalDefType = lib.types.either positionalEntryType (lib.types.listOf positionalEntryType);
 
