@@ -113,6 +113,30 @@ let
     }
   );
 
+  # `checkFile` body for an option (and, in a later commit, positional)
+  # entry: a `values`-shaped dict of decisions plus an `onUnreadable`
+  # fallback for when the file can't be read.
+  fileCheckType = lib.types.submodule {
+    options = {
+      values = lib.mkOption {
+        type = lib.types.attrsOf valueEntryType;
+        default = { };
+        description = ''
+          Exact / `isPattern: true` / wildcard entries matched against the
+          file's contents (rather than the literal value string).
+        '';
+      };
+      onUnreadable = lib.mkOption {
+        type = decisionType;
+        default = "deny";
+        description = ''
+          Decision when the referenced file cannot be read: blocked by
+          read globs, missing on disk, oversized, or generic I/O error.
+        '';
+      };
+    };
+  };
+
   optionEntryType = lib.types.either conditionalDecisionType (
     lib.types.submodule {
       options = {
@@ -135,6 +159,16 @@ let
           type = lib.types.nullOr (lib.types.attrsOf valueEntryType);
           default = null;
           description = "Per-value decision overrides.";
+        };
+        checkFile = lib.mkOption {
+          type = lib.types.nullOr fileCheckType;
+          default = null;
+          description = ''
+            Inspect the contents of the file the value refers to. The
+            file's contents are matched against `checkFile.values` using
+            the same exact / `isPattern: true` / wildcard rules as a
+            normal value lookup.
+          '';
         };
       };
     }

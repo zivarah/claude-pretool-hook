@@ -321,6 +321,31 @@ pub struct OptionEntry {
     pub aliases: Vec<String>,
     pub allow_expansions: bool,
     pub values: Option<WildcardMap<DecisionSpec>>,
+    /// When set, the value is treated as a path to a file; the file's
+    /// contents are read and matched against `check_file.values` using the
+    /// same exact/pattern/wildcard rules as a normal value lookup.
+    pub check_file: Option<FileCheck>,
+}
+
+/// Opt-in companion to `OptionEntry.values` (and the analogous positional
+/// field) that runs a `values`-shaped dict against the *contents* of the
+/// referenced file rather than the literal value string.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCheck {
+    /// Exact-match / `isPattern: true` / wildcard entries, matched against
+    /// the file's contents.
+    pub values: WildcardMap<DecisionSpec>,
+    /// Decision when the file cannot be read (path blocked by file-access
+    /// globs, missing on disk, oversized, or a generic I/O error). Defaults
+    /// to `deny` — if the rule declared an intent to inspect contents,
+    /// failing to inspect cannot resolve to allow.
+    #[serde(default = "default_on_unreadable")]
+    pub on_unreadable: Decision,
+}
+
+fn default_on_unreadable() -> Decision {
+    Decision::Deny
 }
 
 impl<'de> Deserialize<'de> for OptionEntry {
@@ -346,6 +371,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 allow_expansions: bool,
                 #[serde(default)]
                 values: Option<WildcardMap<DecisionSpec>>,
+                #[serde(default, rename = "checkFile")]
+                check_file: Option<FileCheck>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -355,6 +382,7 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 aliases: vec![],
                 allow_expansions: false,
                 values: None,
+                check_file: None,
             }),
             Raw::BareConditional(cond) => Ok(OptionEntry {
                 decision: Decision::Ask,
@@ -369,6 +397,7 @@ impl<'de> Deserialize<'de> for OptionEntry {
                         is_pattern: false,
                     })),
                 }),
+                check_file: None,
             }),
             Raw::Full {
                 decision,
@@ -376,12 +405,14 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 aliases,
                 allow_expansions,
                 values,
+                check_file,
             } => Ok(OptionEntry {
                 decision,
                 force,
                 aliases,
                 allow_expansions,
                 values,
+                check_file,
             }),
         }
     }
@@ -602,6 +633,49 @@ mod tests {
             serde_json::from_str(r#"{"decision":"deny","force":true,"isPattern":true}"#).unwrap();
         assert!(spec.force);
         assert!(spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_option_entry_with_check_file() {
+        let entry: OptionEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "checkFile": {
+                    "values": {
+                        "\\bsystem\\(": { "decision": "ask", "isPattern": true },
+                        "*": "allow"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let check = entry.check_file.expect("checkFile should be present");
+        assert_eq!(check.on_unreadable, Decision::Deny);
+        assert!(check.values.entries.contains_key("\\bsystem\\("));
+        assert!(check.values.wildcard().is_some());
+    }
+
+    #[test]
+    fn deserialize_check_file_on_unreadable_override() {
+        let entry: OptionEntry = serde_json::from_str(
+            r#"{
+                "decision": "allow",
+                "checkFile": {
+                    "values": { "*": "allow" },
+                    "onUnreadable": "ask"
+                }
+            }"#,
+        )
+        .unwrap();
+        let check = entry.check_file.expect("checkFile should be present");
+        assert_eq!(check.on_unreadable, Decision::Ask);
+    }
+
+    #[test]
+    fn deserialize_option_entry_without_check_file() {
+        let entry: OptionEntry =
+            serde_json::from_str(r#"{"decision":"allow","values":{"*":"allow"}}"#).unwrap();
+        assert!(entry.check_file.is_none());
     }
 
     #[test]
