@@ -446,14 +446,11 @@ impl<'de> Deserialize<'de> for PositionalEntry {
     where
         D: serde::Deserializer<'de>,
     {
-        // Tried in order. `Rich` requires a `decision` field plus at
-        // least one of `values` / `checkFile` to be present; without
-        // those it would just shadow what `Bare` already handles. The
-        // `with_extras` flag is set by serde when either field is
-        // present (defaults are `None`), and we fall through to `Bare`
-        // when neither is set so the existing bare-object form
-        // `{"decision":"allow"}` continues to round-trip through
-        // `DecisionNode`'s own custom Deserialize unchanged.
+        // Use serde_json::Value for explicit dispatch rather than an inner
+        // untagged enum. The buffered Content deserializer that serde uses
+        // for nested untagged enums (PositionalDef → PositionalEntry → Raw)
+        // can silently mis-classify a 1-element array as a single object,
+        // so we peek the parsed value here and route by shape.
         #[derive(Deserialize)]
         struct RawRich {
             decision: DecisionNode,
@@ -463,32 +460,26 @@ impl<'de> Deserialize<'de> for PositionalEntry {
             check_file: Option<FileCheck>,
         }
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            // Try the rich form first so an object containing `values`
-            // or `checkFile` isn't swallowed by DecisionNode's own
-            // object-form deserialize.
-            Rich(RawRich),
-            Bare(DecisionNode),
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // Rich requires an object with `decision` plus at least one of
+        // `values` / `checkFile`. Without an overlay we collapse to Bare
+        // so the simple-case evaluator path stays unchanged.
+        if let serde_json::Value::Object(map) = &value {
+            let has_overlay = map.contains_key("values") || map.contains_key("checkFile");
+            if has_overlay && map.contains_key("decision") {
+                let rich: RawRich =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                return Ok(PositionalEntry::Rich {
+                    decision: rich.decision,
+                    values: rich.values,
+                    check_file: rich.check_file,
+                });
+            }
         }
 
-        match Raw::deserialize(deserializer)? {
-            Raw::Rich(r) => {
-                if r.values.is_none() && r.check_file.is_none() {
-                    // No actual overlay specified — treat as bare so
-                    // downstream evaluator code can take the simpler path.
-                    Ok(PositionalEntry::Bare(r.decision))
-                } else {
-                    Ok(PositionalEntry::Rich {
-                        decision: r.decision,
-                        values: r.values,
-                        check_file: r.check_file,
-                    })
-                }
-            }
-            Raw::Bare(node) => Ok(PositionalEntry::Bare(node)),
-        }
+        let node: DecisionNode = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(PositionalEntry::Bare(node))
     }
 }
 
@@ -504,11 +495,32 @@ impl PositionalEntry {
 }
 
 /// The value is either a single entry or an array of entries.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 pub enum PositionalDef {
     Single(PositionalEntry),
     Array(Vec<PositionalEntry>),
+}
+
+impl<'de> Deserialize<'de> for PositionalDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Explicit array-vs-object dispatch via serde_json::Value.
+        // An untagged Single/Array enum here has been observed to misclassify
+        // a 1-element array as a Single, because the buffered Content
+        // deserializer can route a `[obj]` into a struct deserializer.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_array() {
+            let entries: Vec<PositionalEntry> =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(PositionalDef::Array(entries))
+        } else {
+            let entry: PositionalEntry =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(PositionalDef::Single(entry))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +849,44 @@ mod tests {
         assert!(values.is_none());
         let check = check_file.expect("checkFile present");
         assert_eq!(check.on_unreadable, Decision::Ask);
+    }
+
+    #[test]
+    fn deserialize_positional_def_single_rich() {
+        // Direct PositionalDef parse: a single rich entry (not an array).
+        let def: PositionalDef = serde_json::from_str(
+            r#"{ "decision": "allow", "values": { "x": "deny", "*": "allow" } }"#,
+        )
+        .unwrap();
+        match def {
+            PositionalDef::Single(PositionalEntry::Rich { values, .. }) => {
+                assert!(values.is_some(), "values should be Some on Rich");
+            }
+            other => panic!("expected Single(Rich), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_positional_def_array_of_rich() {
+        // Direct PositionalDef parse: array with a rich entry — this is the
+        // shape that the in-evaluator test uses, and that we want to confirm
+        // round-trips through PositionalDef → PositionalEntry without losing
+        // the `values` overlay.
+        let def: PositionalDef = serde_json::from_str(
+            r#"[ { "decision": "allow", "values": { "x": "deny", "*": "allow" } } ]"#,
+        )
+        .unwrap();
+        let entries = match def {
+            PositionalDef::Array(v) => v,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            PositionalEntry::Rich { values, .. } => {
+                assert!(values.is_some(), "values should be Some on array's Rich");
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
     }
 
     #[test]

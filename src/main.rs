@@ -258,14 +258,17 @@ fn evaluate_commands(
 
         let stripped = evaluate::strip_wrappers(command, bash_rules);
         let has_non_literal = stripped.expansion_flags.iter().any(|&e| e);
+        let eval_ctx = evaluate::EvalCtx {
+            fa,
+            cwd: cwd.to_str().unwrap_or("/"),
+        };
         let result = evaluate::evaluate_command(
             &stripped.args,
             &stripped.expansion_flags,
             has_non_literal,
             stripped.force_allow,
             bash_rules,
-            fa,
-            cwd.to_str().unwrap_or("/"),
+            &eval_ctx,
         );
 
         match &result {

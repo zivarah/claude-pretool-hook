@@ -6,9 +6,18 @@ use crate::{
     path::{self, CompiledFileAccess, FileCheckRead, FILE_CHECK_MAX_BYTES},
     rules::{
         lookup_with_alias, BashRules, CommandNode, DecisionSpec, FileCheck, FlagEntry, FlagKind,
-        OptionEntry, PositionalDef, WildcardMap,
+        OptionEntry, PositionalDef, PositionalEntry, WildcardMap,
     },
 };
+
+/// Per-evaluation context that flows unchanged through the recursive call
+/// graph: everything path-resolution code needs (the compiled file-access
+/// rules and the hook's working directory). Bundled so eval helpers don't
+/// accumulate parameter pairs at every signature.
+pub struct EvalCtx<'a> {
+    pub fa: &'a CompiledFileAccess,
+    pub cwd: &'a str,
+}
 
 /// A decision paired with the reason it was made.
 #[derive(Clone)]
@@ -239,8 +248,7 @@ pub fn evaluate_command(
     has_non_literal: bool,
     force_allow: bool,
     rules: &BashRules,
-    fa: &CompiledFileAccess,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
 ) -> EvalResult {
     if force_allow {
         return EvalResult::Decided {
@@ -288,8 +296,7 @@ pub fn evaluate_command(
             node,
             &original,
             &format!("command '{cmd}'"),
-            fa,
-            cwd,
+            eval_ctx,
         ),
     }
 }
@@ -309,8 +316,7 @@ fn evaluate_node(
     node: &CommandNode,
     original_cmd: &str,
     matched_rule: &str,
-    fa: &CompiledFileAccess,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
 ) -> EvalResult {
     let cmd_str = original_cmd;
 
@@ -324,7 +330,7 @@ fn evaluate_node(
             if let Some(subcmd_node) = subcmds.entries.get(subcmd_name.as_str()) {
                 // Collect pre-subcmd flag/option decisions.
                 let (pre_judgments, pre_path_checks) =
-                    collect_pre_subcmd_decisions(args, idx, node, original_cmd, fa, cwd);
+                    collect_pre_subcmd_decisions(args, idx, node, original_cmd, eval_ctx);
 
                 // Build remaining args: [cmd_name] + args after subcmd.
                 let mut remaining_args = vec![args[0].clone()];
@@ -339,8 +345,7 @@ fn evaluate_node(
                     subcmd_node,
                     original_cmd,
                     &format!("subcmd '{subcmd_name}'"),
-                    fa,
-                    cwd,
+                    eval_ctx,
                 );
 
                 if pre_judgments.is_empty() && pre_path_checks.is_empty() {
@@ -425,6 +430,7 @@ fn evaluate_node(
                     arg,
                     cmd_str,
                     &pos_args,
+                    eval_ctx,
                     &mut judgments,
                     &mut path_checks,
                 );
@@ -450,8 +456,7 @@ fn evaluate_node(
                         &args[i],
                         value,
                         cmd_str,
-                        fa,
-                        cwd,
+                        eval_ctx,
                         &mut judgments,
                         &mut path_checks,
                     );
@@ -463,8 +468,7 @@ fn evaluate_node(
                             name,
                             eq_value,
                             cmd_str,
-                            fa,
-                            cwd,
+                            eval_ctx,
                             &mut judgments,
                             &mut path_checks,
                         );
@@ -486,7 +490,7 @@ fn evaluate_node(
     // Positional (ordered, keyed by count)
     let (positional_judgments, positional_path_checks) = if let Some(positional) = &node.positional
     {
-        collect_positional_decisions(positional, &pos_args, cmd_str, "positional")
+        collect_positional_decisions(positional, &pos_args, cmd_str, eval_ctx, "positional")
     } else {
         (Vec::new(), Vec::new())
     };
@@ -496,7 +500,7 @@ fn evaluate_node(
     if let Some(cwd_node) = &node.cwd_check {
         classify_positional_entry(
             cwd_node,
-            cwd,
+            eval_ctx.cwd,
             cmd_str,
             "cwdCheck",
             &mut judgments,
@@ -543,6 +547,7 @@ fn collect_flag_decisions(
     arg: &str,
     cmd_str: &str,
     pos_args: &[Positional],
+    eval_ctx: &EvalCtx,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
@@ -556,9 +561,57 @@ fn collect_flag_decisions(
         }
         FlagKind::Positional(pos_defs) => {
             let context = format!("flag '{arg}' positional");
-            let (pj, pc) = collect_positional_decisions(pos_defs, pos_args, cmd_str, &context);
+            let (pj, pc) =
+                collect_positional_decisions(pos_defs, pos_args, cmd_str, eval_ctx, &context);
             judgments.extend(pj);
             path_checks.extend(pc);
+        }
+    }
+}
+
+/// Evaluate a positional arg against a `PositionalEntry`. The base
+/// `DecisionNode` is classified the same way as before; if the entry is
+/// the `Rich` form, any `values` overlay is matched against the arg
+/// value and any `checkFile` overlay is matched against file contents.
+/// Each overlay match contributes a separate judgment / path check; the
+/// caller merges them.
+fn evaluate_positional_entry(
+    entry: &PositionalEntry,
+    path_val: &str,
+    cmd_str: &str,
+    eval_ctx: &EvalCtx,
+    context: &str,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    classify_positional_entry(
+        entry.decision_node(),
+        path_val,
+        cmd_str,
+        context,
+        judgments,
+        path_checks,
+    );
+
+    if let PositionalEntry::Rich {
+        values, check_file, ..
+    } = entry
+    {
+        if let Some(values) = values {
+            let label = format!("{} arg", context);
+            lookup_value_in_map(values, path_val, cmd_str, &label, judgments, path_checks);
+        }
+        if let Some(check) = check_file {
+            let label = format!("{} arg", context);
+            evaluate_check_file(
+                check,
+                path_val,
+                cmd_str,
+                &label,
+                eval_ctx,
+                judgments,
+                path_checks,
+            );
         }
     }
 }
@@ -600,6 +653,7 @@ fn collect_positional_decisions(
     pos_defs: &WildcardMap<PositionalDef>,
     pos_args: &[Positional],
     cmd_str: &str,
+    eval_ctx: &EvalCtx,
     context: &str,
 ) -> (Vec<Judgment>, Vec<PathCheck>) {
     let mut judgments = Vec::new();
@@ -615,10 +669,11 @@ fn collect_positional_decisions(
         Some(PositionalDef::Array(entries)) => {
             for (i, entry) in entries.iter().enumerate() {
                 let path_val = pos_args.get(i).map(|p| p.value.as_str()).unwrap_or("");
-                classify_positional_entry(
-                    entry.decision_node(),
+                evaluate_positional_entry(
+                    entry,
                     path_val,
                     cmd_str,
+                    eval_ctx,
                     context,
                     &mut judgments,
                     &mut path_checks,
@@ -632,10 +687,11 @@ fn collect_positional_decisions(
                 &pos_args[..1.min(pos_args.len())]
             };
             for pos in targets {
-                classify_positional_entry(
-                    entry.decision_node(),
+                evaluate_positional_entry(
+                    entry,
                     &pos.value,
                     cmd_str,
+                    eval_ctx,
                     context,
                     &mut judgments,
                     &mut path_checks,
@@ -665,8 +721,7 @@ fn evaluate_option_value(
     option_name: &str,
     value: &str,
     cmd_str: &str,
-    fa: &CompiledFileAccess,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
@@ -691,8 +746,7 @@ fn evaluate_option_value(
             value,
             cmd_str,
             option_name,
-            fa,
-            cwd,
+            eval_ctx,
             judgments,
             path_checks,
         );
@@ -708,13 +762,13 @@ fn evaluate_check_file(
     value: &str,
     cmd_str: &str,
     option_name: &str,
-    fa: &CompiledFileAccess,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
-    let cwd_path = std::path::Path::new(cwd);
-    let read_result = match path::read_for_check(value, fa, cwd_path, FILE_CHECK_MAX_BYTES) {
+    let cwd_path = std::path::Path::new(eval_ctx.cwd);
+    let read_result = match path::read_for_check(value, eval_ctx.fa, cwd_path, FILE_CHECK_MAX_BYTES)
+    {
         Ok(r) => r,
         Err(err) => {
             judgments.push(Judgment::new(
@@ -899,8 +953,7 @@ fn collect_pre_subcmd_decisions(
     subcmd_idx: usize,
     node: &CommandNode,
     original_cmd: &str,
-    fa: &CompiledFileAccess,
-    cwd: &str,
+    eval_ctx: &EvalCtx,
 ) -> (Vec<Judgment>, Vec<PathCheck>) {
     let cmd_str = original_cmd;
     let mut judgments = Vec::new();
@@ -924,8 +977,7 @@ fn collect_pre_subcmd_decisions(
                     arg,
                     value,
                     cmd_str,
-                    fa,
-                    cwd,
+                    eval_ctx,
                     &mut judgments,
                     &mut path_checks,
                 );
@@ -939,8 +991,7 @@ fn collect_pre_subcmd_decisions(
                         name,
                         eq_value,
                         cmd_str,
-                        fa,
-                        cwd,
+                        eval_ctx,
                         &mut judgments,
                         &mut path_checks,
                     );
@@ -1051,9 +1102,18 @@ mod tests {
     fn eval(strs: &[&str]) -> EvalResult {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
-        let fa = test_fa();
         let (a, e) = args(strs);
-        evaluate_command(&a, &e, false, false, bash, &fa, TEST_CWD)
+        evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        )
     }
 
     /// Helper: extract decision from EvalResult.
@@ -1070,7 +1130,17 @@ mod tests {
     fn empty_args_ask() {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
-        let result = evaluate_command(&[], &[], false, false, bash, &test_fa(), TEST_CWD);
+        let result = evaluate_command(
+            &[],
+            &[],
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -1112,7 +1182,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["anything"]);
-        let result = evaluate_command(&a, &e, false, true, bash, &test_fa(), TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            true,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1250,7 +1330,17 @@ mod tests {
             globally_allowed_flags: vec![],
         };
         let (a, e) = args(strs);
-        evaluate_command(&a, &e, false, false, &bash, &test_fa(), TEST_CWD)
+        evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            &bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        )
     }
 
     #[test]
@@ -1412,12 +1502,6 @@ mod tests {
     // contents are covered end-to-end by integration tests that run the
     // real binary against real on-disk script files.
 
-    fn write_tmp_script(name: &str, contents: &str) -> String {
-        let path = std::env::temp_dir().join(format!("cph-eval-{}-{}", std::process::id(), name));
-        std::fs::write(&path, contents).expect("write temp file");
-        path.to_str().expect("utf-8 path").to_owned()
-    }
-
     #[test]
     fn check_file_unreadable_defaults_to_deny() {
         // path is blocked by the test_fa's `!**/*.secret*` read denylist.
@@ -1457,6 +1541,87 @@ mod tests {
         }"#;
         let result = eval_with_commands(rules, &["tool", "-f", "/tmp/blocked.secret"]);
         assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    // --- Rich positional entries (values + checkFile on positionals) ---
+
+    #[test]
+    fn positional_rich_values_pattern_match() {
+        // The bare script-as-positional case: a regex pattern in the
+        // positional's `values` matches a `system(` call in the script
+        // text and forces an ask judgment.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": [{
+                        "decision": "allow",
+                        "values": {
+                            "\\bsystem\\(": { "decision": "ask", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "BEGIN{system(\"rm -rf /\")}"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn positional_rich_values_no_match_falls_through() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": [{
+                        "decision": "allow",
+                        "values": {
+                            "\\bsystem\\(": { "decision": "deny", "isPattern": true },
+                            "*": "allow"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "{print $1}"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn positional_rich_check_file_unreadable_uses_on_unreadable() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "*": [{
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" },
+                            "onUnreadable": "ask"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn positional_bare_form_still_works() {
+        // Sanity check: existing bare-decision positional entries are
+        // unaffected by the new richer shape.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "positional": {
+                    "1": ["deny"]
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "anything"]);
+        assert_eq!(decision(&result), Decision::Deny);
     }
 
     // --- Pre-subcmd flags/options ---
@@ -1559,7 +1724,17 @@ mod tests {
         // ls has no allow_expansions — expansion in arg is uncovered
         let a: Vec<String> = vec!["ls".into(), "".into()];
         let e = vec![false, true]; // second arg is non-literal
-        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -1570,7 +1745,17 @@ mod tests {
         // env has allowExpansions: true at node level
         let a: Vec<String> = vec!["env".into(), "".into()];
         let e = vec![false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1586,7 +1771,17 @@ mod tests {
             "".into(), // expansion in value position
         ];
         let e = vec![false, false, false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
+        let result = evaluate_command(
+            &a,
+            &e,
+            true,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: TEST_CWD,
+            },
+        );
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1854,7 +2049,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp/project");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp/project",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 // Should have path checks for: positional (archive readable) + cwdCheck (cwd writable)
@@ -1890,7 +2095,17 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "-l", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp/project");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp/project",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(path_checks.iter().any(|pc| pc.path == "/tmp/project"));
@@ -1946,7 +2161,17 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // curl --output=/tmp/file should produce a path check for /tmp/file
         let (a, e) = args(&["curl", "--request", "GET", "--output=/tmp/file"]);
-        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp",
+            },
+        );
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(
@@ -1964,7 +2189,17 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // sort --output=/tmp/file should NOT be an unknown flag
         let (a, e) = args(&["sort", "--output=/tmp/sorted.txt", "input.txt"]);
-        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp");
+        let result = evaluate_command(
+            &a,
+            &e,
+            false,
+            false,
+            bash,
+            &EvalCtx {
+                fa: &test_fa(),
+                cwd: "/tmp",
+            },
+        );
         match &result {
             EvalResult::Decided { reason, .. } => {
                 assert!(
