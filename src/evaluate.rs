@@ -3,9 +3,10 @@ use regex::Regex;
 use crate::{
     bash::ExtractedCommand,
     decision::{stricter, Decision, DecisionNode, EvalResult, PathCheck},
+    path::{self, CompiledFileAccess, FileCheckRead, FILE_CHECK_MAX_BYTES},
     rules::{
-        lookup_with_alias, BashRules, CommandNode, DecisionSpec, FlagEntry, FlagKind, OptionEntry,
-        PositionalDef, WildcardMap,
+        lookup_with_alias, BashRules, CommandNode, DecisionSpec, FileCheck, FlagEntry, FlagKind,
+        OptionEntry, PositionalDef, WildcardMap,
     },
 };
 
@@ -238,6 +239,7 @@ pub fn evaluate_command(
     has_non_literal: bool,
     force_allow: bool,
     rules: &BashRules,
+    fa: &CompiledFileAccess,
     cwd: &str,
 ) -> EvalResult {
     if force_allow {
@@ -286,6 +288,7 @@ pub fn evaluate_command(
             node,
             &original,
             &format!("command '{cmd}'"),
+            fa,
             cwd,
         ),
     }
@@ -306,6 +309,7 @@ fn evaluate_node(
     node: &CommandNode,
     original_cmd: &str,
     matched_rule: &str,
+    fa: &CompiledFileAccess,
     cwd: &str,
 ) -> EvalResult {
     let cmd_str = original_cmd;
@@ -320,7 +324,7 @@ fn evaluate_node(
             if let Some(subcmd_node) = subcmds.entries.get(subcmd_name.as_str()) {
                 // Collect pre-subcmd flag/option decisions.
                 let (pre_judgments, pre_path_checks) =
-                    collect_pre_subcmd_decisions(args, idx, node, original_cmd);
+                    collect_pre_subcmd_decisions(args, idx, node, original_cmd, fa, cwd);
 
                 // Build remaining args: [cmd_name] + args after subcmd.
                 let mut remaining_args = vec![args[0].clone()];
@@ -335,6 +339,7 @@ fn evaluate_node(
                     subcmd_node,
                     original_cmd,
                     &format!("subcmd '{subcmd_name}'"),
+                    fa,
                     cwd,
                 );
 
@@ -445,17 +450,21 @@ fn evaluate_node(
                         &args[i],
                         value,
                         cmd_str,
+                        fa,
+                        cwd,
                         &mut judgments,
                         &mut path_checks,
                     );
                 } else if let Some((name, eq_value)) = split_option_eq(&args[i]) {
                     if let Some(entry) = lookup_with_alias(name, options) {
-                        // Equals form: --output=/tmp/file
+                        // Equals form: --option=value
                         evaluate_option_value(
                             entry,
                             name,
                             eq_value,
                             cmd_str,
+                            fa,
+                            cwd,
                             &mut judgments,
                             &mut path_checks,
                         );
@@ -647,16 +656,23 @@ fn collect_positional_decisions(
     (judgments, path_checks)
 }
 
-/// Evaluate an option entry's value, pushing either a `Judgment` or `PathCheck`.
+/// Evaluate an option entry's value, pushing one or more `Judgment`s /
+/// `PathCheck`s. Runs the value-based lookup first, then (if `checkFile`
+/// is set) reads the referenced file and runs `checkFile.values` against
+/// the file contents.
 fn evaluate_option_value(
     entry: &OptionEntry,
     option_name: &str,
     value: &str,
     cmd_str: &str,
+    fa: &CompiledFileAccess,
+    cwd: &str,
     judgments: &mut Vec<Judgment>,
     path_checks: &mut Vec<PathCheck>,
 ) {
-    let Some(values) = &entry.values else {
+    if let Some(values) = &entry.values {
+        lookup_value_in_map(values, value, cmd_str, option_name, judgments, path_checks);
+    } else {
         judgments.push(Judgment {
             decision: entry.decision,
             force: entry.force,
@@ -667,9 +683,76 @@ fn evaluate_option_value(
                 entry.decision.description()
             ),
         });
-        return;
+    }
+
+    if let Some(check) = &entry.check_file {
+        evaluate_check_file(
+            check,
+            value,
+            cmd_str,
+            option_name,
+            fa,
+            cwd,
+            judgments,
+            path_checks,
+        );
+    }
+}
+
+/// Read the file at `value` (gated by file-access globs and the size cap)
+/// and run `check.values` against its contents using the same lookup
+/// machinery as a normal value lookup. Read failures emit a single
+/// `check.on_unreadable` judgment with a reason describing the failure.
+fn evaluate_check_file(
+    check: &FileCheck,
+    value: &str,
+    cmd_str: &str,
+    option_name: &str,
+    fa: &CompiledFileAccess,
+    cwd: &str,
+    judgments: &mut Vec<Judgment>,
+    path_checks: &mut Vec<PathCheck>,
+) {
+    let cwd_path = std::path::Path::new(cwd);
+    let read_result = match path::read_for_check(value, fa, cwd_path, FILE_CHECK_MAX_BYTES) {
+        Ok(r) => r,
+        Err(err) => {
+            judgments.push(Judgment::new(
+                check.on_unreadable,
+                format!(
+                    "'{}': option '{}' checkFile path error on '{}': {}",
+                    cmd_str, option_name, value, err
+                ),
+            ));
+            return;
+        }
     };
-    lookup_value_in_map(values, value, cmd_str, option_name, judgments, path_checks);
+
+    match read_result {
+        FileCheckRead::Unreadable(reason) => {
+            judgments.push(Judgment::new(
+                check.on_unreadable,
+                format!(
+                    "'{}': option '{}' checkFile unreadable: {}",
+                    cmd_str, option_name, reason
+                ),
+            ));
+        }
+        FileCheckRead::Contents(contents) => {
+            // Re-use the same exact/pattern/wildcard machinery as value
+            // lookup, but matched against file contents. The option_name
+            // is annotated so the reason makes the source obvious.
+            let context = format!("{} (file contents)", option_name);
+            lookup_value_in_map(
+                &check.values,
+                &contents,
+                cmd_str,
+                &context,
+                judgments,
+                path_checks,
+            );
+        }
+    }
 }
 
 /// Resolve a value against a `WildcardMap<DecisionSpec>` (option `values`,
@@ -816,6 +899,8 @@ fn collect_pre_subcmd_decisions(
     subcmd_idx: usize,
     node: &CommandNode,
     original_cmd: &str,
+    fa: &CompiledFileAccess,
+    cwd: &str,
 ) -> (Vec<Judgment>, Vec<PathCheck>) {
     let cmd_str = original_cmd;
     let mut judgments = Vec::new();
@@ -834,7 +919,16 @@ fn collect_pre_subcmd_decisions(
             if let Some(entry) = lookup_with_alias(arg, options) {
                 // Space-separated form: --option value
                 let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-                evaluate_option_value(entry, arg, value, cmd_str, &mut judgments, &mut path_checks);
+                evaluate_option_value(
+                    entry,
+                    arg,
+                    value,
+                    cmd_str,
+                    fa,
+                    cwd,
+                    &mut judgments,
+                    &mut path_checks,
+                );
                 found = true;
                 i += 1; // skip the option's value
             } else if let Some((name, eq_value)) = split_option_eq(arg) {
@@ -845,6 +939,8 @@ fn collect_pre_subcmd_decisions(
                         name,
                         eq_value,
                         cmd_str,
+                        fa,
+                        cwd,
                         &mut judgments,
                         &mut path_checks,
                     );
@@ -936,6 +1032,12 @@ mod tests {
         rules.tools.bash.as_ref().expect("Bash rules should exist")
     }
 
+    fn test_fa() -> CompiledFileAccess {
+        let rules = test_rules();
+        CompiledFileAccess::compile(&rules.file_access, std::path::Path::new(TEST_CWD), None)
+            .expect("compile file access")
+    }
+
     /// Helper: build args and uniform expansion_flags (all literal).
     fn args(strs: &[&str]) -> (Vec<String>, Vec<bool>) {
         let a: Vec<String> = strs.iter().map(|s| s.to_string()).collect();
@@ -949,8 +1051,9 @@ mod tests {
     fn eval(strs: &[&str]) -> EvalResult {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
+        let fa = test_fa();
         let (a, e) = args(strs);
-        evaluate_command(&a, &e, false, false, bash, TEST_CWD)
+        evaluate_command(&a, &e, false, false, bash, &fa, TEST_CWD)
     }
 
     /// Helper: extract decision from EvalResult.
@@ -967,7 +1070,7 @@ mod tests {
     fn empty_args_ask() {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
-        let result = evaluate_command(&[], &[], false, false, bash, TEST_CWD);
+        let result = evaluate_command(&[], &[], false, false, bash, &test_fa(), TEST_CWD);
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -1009,7 +1112,7 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["anything"]);
-        let result = evaluate_command(&a, &e, false, true, bash, TEST_CWD);
+        let result = evaluate_command(&a, &e, false, true, bash, &test_fa(), TEST_CWD);
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1147,7 +1250,7 @@ mod tests {
             globally_allowed_flags: vec![],
         };
         let (a, e) = args(strs);
-        evaluate_command(&a, &e, false, false, &bash, TEST_CWD)
+        evaluate_command(&a, &e, false, false, &bash, &test_fa(), TEST_CWD)
     }
 
     #[test]
@@ -1301,6 +1404,61 @@ mod tests {
         assert_eq!(decision(&result), Decision::Allow);
     }
 
+    // --- checkFile on options ---
+    //
+    // Only the pure-CPU branches of checkFile evaluation live here: paths
+    // blocked by read globs (no filesystem access) and the `onUnreadable`
+    // fallback override. Successful reads and pattern matches against file
+    // contents are covered end-to-end by integration tests that run the
+    // real binary against real on-disk script files.
+
+    fn write_tmp_script(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!("cph-eval-{}-{}", std::process::id(), name));
+        std::fs::write(&path, contents).expect("write temp file");
+        path.to_str().expect("utf-8 path").to_owned()
+    }
+
+    #[test]
+    fn check_file_unreadable_defaults_to_deny() {
+        // path is blocked by the test_fa's `!**/*.secret*` read denylist.
+        // No filesystem access; on_unreadable defaults to deny.
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "-f": {
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "-f", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn check_file_unreadable_with_on_unreadable_ask() {
+        let rules = r#"{
+            "tool": {
+                "decision": "allow",
+                "options": {
+                    "-f": {
+                        "decision": "allow",
+                        "checkFile": {
+                            "values": { "*": "allow" },
+                            "onUnreadable": "ask"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let result = eval_with_commands(rules, &["tool", "-f", "/tmp/blocked.secret"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
     // --- Pre-subcmd flags/options ---
 
     #[test]
@@ -1401,7 +1559,7 @@ mod tests {
         // ls has no allow_expansions — expansion in arg is uncovered
         let a: Vec<String> = vec!["ls".into(), "".into()];
         let e = vec![false, true]; // second arg is non-literal
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
         assert_eq!(decision(&result), Decision::Ask);
     }
 
@@ -1412,7 +1570,7 @@ mod tests {
         // env has allowExpansions: true at node level
         let a: Vec<String> = vec!["env".into(), "".into()];
         let e = vec![false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1428,7 +1586,7 @@ mod tests {
             "".into(), // expansion in value position
         ];
         let e = vec![false, false, false, true];
-        let result = evaluate_command(&a, &e, true, false, bash, TEST_CWD);
+        let result = evaluate_command(&a, &e, true, false, bash, &test_fa(), TEST_CWD);
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -1696,7 +1854,7 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp/project");
+        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp/project");
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 // Should have path checks for: positional (archive readable) + cwdCheck (cwd writable)
@@ -1732,7 +1890,7 @@ mod tests {
         let rules = test_rules();
         let bash = test_bash_rules(&rules);
         let (a, e) = args(&["unzip", "-l", "/tmp/archive.zip"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp/project");
+        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp/project");
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(path_checks.iter().any(|pc| pc.path == "/tmp/project"));
@@ -1788,7 +1946,7 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // curl --output=/tmp/file should produce a path check for /tmp/file
         let (a, e) = args(&["curl", "--request", "GET", "--output=/tmp/file"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp");
         match &result {
             EvalResult::CheckPaths { path_checks, .. } => {
                 assert!(
@@ -1806,7 +1964,7 @@ mod tests {
         let bash = test_bash_rules(&rules);
         // sort --output=/tmp/file should NOT be an unknown flag
         let (a, e) = args(&["sort", "--output=/tmp/sorted.txt", "input.txt"]);
-        let result = evaluate_command(&a, &e, false, false, bash, "/tmp");
+        let result = evaluate_command(&a, &e, false, false, bash, &test_fa(), "/tmp");
         match &result {
             EvalResult::Decided { reason, .. } => {
                 assert!(
