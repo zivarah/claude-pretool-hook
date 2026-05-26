@@ -115,6 +115,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for WildcardMap<T> {
 pub struct DecisionSpec {
     pub node: DecisionNode,
     pub force: bool,
+    pub is_pattern: bool,
 }
 
 impl<'de> Deserialize<'de> for DecisionSpec {
@@ -126,21 +127,33 @@ impl<'de> Deserialize<'de> for DecisionSpec {
         #[serde(untagged)]
         enum Raw {
             // Object with a "decision" key — tried first to capture the
-            // optional "force" field before DecisionNode consumes the object.
+            // optional "force" / "isPattern" fields before DecisionNode
+            // consumes the object.
             Full {
                 decision: DecisionNode,
                 #[serde(default)]
                 force: bool,
+                #[serde(default, rename = "isPattern")]
+                is_pattern: bool,
             },
-            // Bare string ("allow") or bare conditional ({"if":...}) — force defaults to false.
+            // Bare string ("allow") or bare conditional ({"if":...}).
             Bare(DecisionNode),
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Full { decision, force } => Ok(DecisionSpec {
+            Raw::Full {
+                decision,
+                force,
+                is_pattern,
+            } => Ok(DecisionSpec {
                 node: decision,
                 force,
+                is_pattern,
             }),
-            Raw::Bare(node) => Ok(DecisionSpec { node, force: false }),
+            Raw::Bare(node) => Ok(DecisionSpec {
+                node,
+                force: false,
+                is_pattern: false,
+            }),
         }
     }
 }
@@ -353,6 +366,7 @@ impl<'de> Deserialize<'de> for OptionEntry {
                     wildcard: Some(Box::new(DecisionSpec {
                         node: DecisionNode::Conditional(Box::new(cond)),
                         force: false,
+                        is_pattern: false,
                     })),
                 }),
             }),
@@ -561,6 +575,33 @@ mod tests {
         .unwrap();
         assert!(matches!(spec.node, DecisionNode::Conditional(_)));
         assert!(spec.force);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_default_is_pattern_false() {
+        let spec: DecisionSpec = serde_json::from_str(r#""allow""#).unwrap();
+        assert!(!spec.is_pattern);
+
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","force":true}"#).unwrap();
+        assert!(!spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_is_pattern_true() {
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","isPattern":true}"#).unwrap();
+        assert!(matches!(spec.node, DecisionNode::Static(Decision::Deny)));
+        assert!(!spec.force);
+        assert!(spec.is_pattern);
+    }
+
+    #[test]
+    fn deserialize_decision_spec_is_pattern_with_force() {
+        let spec: DecisionSpec =
+            serde_json::from_str(r#"{"decision":"deny","force":true,"isPattern":true}"#).unwrap();
+        assert!(spec.force);
+        assert!(spec.is_pattern);
     }
 
     #[test]

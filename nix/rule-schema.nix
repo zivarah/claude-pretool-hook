@@ -64,6 +64,15 @@ let
           description = "Decision for this option value.";
         };
         force = forceOption;
+        isPattern = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            When true, this entry's *key* in the enclosing values dict is
+            evaluated as a regex matched against the value rather than an
+            exact-match string..
+          '';
+        };
       };
     }
   );
