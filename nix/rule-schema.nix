@@ -105,8 +105,22 @@ let
           description = ''
             Positional rules overlaid when this flag is present.
             Keyed by count ("1", "2", "*"). Merged with base
-            positional rules via strictness (deny > ask > allow).
-            Mutually exclusive with decision.
+            positional rules via strictness (deny > ask > allow)
+            unless `overridePositional` is set. Mutually exclusive
+            with decision.
+          '';
+        };
+        overridePositional = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            When true and this flag is present, the parent node's
+            `positional` rule is skipped — only this flag's
+            `positional` (and any other matched flags/options'
+            overlays) contribute to the positional merge. Useful
+            when the flag changes what positional args mean
+            (e.g. `grep -r DIR` makes the first positional a
+            directory rather than a pattern).
           '';
         };
       };
@@ -168,6 +182,29 @@ let
             file's contents are matched against `checkFile.values` using
             the same exact / `isPattern: true` / wildcard rules as a
             normal value lookup.
+          '';
+        };
+        positional = lib.mkOption {
+          type = lib.types.nullOr (lib.types.attrsOf positionalDefType);
+          default = null;
+          description = ''
+            Positional rules applied to args after this option's value
+            (e.g., `sed -e EXPR file1 file2` — the positionals are the
+            files). Keyed by count ("1", "2", "*"). Evaluated in
+            addition to the parent's `positional` unless
+            `overridePositional` is set.
+          '';
+        };
+        overridePositional = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = ''
+            When true and this option is present, the parent node's
+            `positional` rule is skipped — only this option's
+            `positional` (if any) applies. Useful when the option
+            changes what the positionals mean: e.g. `sed -e SCRIPT FILE`
+            makes the lone positional a file rather than a script, so
+            the parent's script-pattern check shouldn't fire.
           '';
         };
       };

@@ -272,8 +272,16 @@ Either a bare decision string or an object. A flag has exactly one of
 "-r": { "decision": "deny", "aliases": ["--recursive"] }
 
 // Positional overlay -- adds path checks to positional args when this flag
-// is present. The flag itself has no standalone decision.
+// is present. The flag itself has no standalone decision. By default the
+// overlay's judgments merge with the command node's top-level `positional`
+// (strictest wins); pass `overridePositional: true` to suppress the parent
+// instead. See [Flag and option positional
+// overlays](#flag-and-option-positional-overlays).
 "-i": { "positional": { "*": { "if": "writable", "then": "allow", "else": "ask" } } }
+"-r": {
+  "positional": { "*": { "if": "readable", "then": "allow", "else": "deny" } },
+  "overridePositional": true
+}
 ```
 
 ### Option entry
@@ -308,6 +316,15 @@ Full-object fields:
 - `checkFile` -- treat the value as a path and run a second
   `values`-shaped lookup against the contents of that file. See
   [`checkFile`](#checkfile).
+- `positional` -- positional rules applied to args appearing *after*
+  this option's value consumes its argument. Same shape as the command
+  node's `positional` (keyed by count). See [Flag and option positional
+  overlays](#flag-and-option-positional-overlays).
+- `overridePositional` -- when `true` and this option is present, the
+  command node's top-level `positional` rule is skipped. Other
+  matched flags'/options' positional overlays still apply. Default
+  `false`. See [Flag and option positional
+  overlays](#flag-and-option-positional-overlays).
 
 Both space-separated (`--output /tmp/file`) and equals-separated
 (`--output=/tmp/file`) forms are recognized. For the equals form, the
@@ -354,6 +371,94 @@ positional arg's literal text is run through the same lookup as
 `checkFile` is present, the positional is treated as a path and the file
 contents are scanned the same way -- useful for `awk 'script' file` where
 the first positional is the script.
+
+### Flag and option positional overlays
+
+In addition to the command node's `positional` rule, **flag** and
+**option** entries can each declare their own `positional` overlay --
+extra positional rules that apply only when that flag or option is
+present in the invocation. This is how `sed -i FILE` overlays a
+writable check on top of `sed`'s base positional rule, or how
+`sed -e EXPR FILE` adds a readability check on the file arg.
+
+Three rules govern how these overlays interact with the command-level
+`positional`:
+
+1. **Each matched flag/option contributes its overlay's judgments to
+   the merge.** A command node's top-level `positional` is evaluated
+   normally, and every present flag/option with a `positional` field
+   *also* runs against the same positional args. All resulting
+   judgments go through the standard "strictest wins" merge (deny >
+   ask > allow), so an overlay can only *tighten* the parent's
+   decision, not relax it.
+
+2. **`overridePositional: true` on a flag or option suppresses the
+   command node's top-level `positional`.** When such a flag/option is
+   matched, the command node's `positional` rule is skipped entirely
+   for the merge. Overlays from *other* matched flags/options still
+   apply -- override only replaces the *parent's* `positional`, not
+   any sibling overlay.
+
+3. **Multiple `overridePositional` flags/options stack additively.**
+   If several matched flags/options each set `overridePositional:
+   true`, the parent's `positional` is skipped once, and every
+   participating overlay contributes its own judgments. They merge
+   with each other (and with non-override overlays) under the usual
+   strictest-wins rule.
+
+The override field exists because the parent's `positional` rule sees
+positional args by count, not by meaning. For some commands a flag or
+option changes what positional args mean: `sed 'SCRIPT' FILE` has the
+script in position 1, but `sed -e 'SCRIPT' FILE` makes position 1 the
+file instead -- and a script-pattern check shouldn't fire on a file
+path. Similarly, `grep PATTERN FILE` has a pattern in position 1, but
+`grep -r DIR` makes position 1 a directory. The flag/option declares
+"when I'm present, ignore the parent's positional assumptions and use
+mine."
+
+```jsonc
+// sed: parent positional treats arg 1 as a script and screens it for
+// dangerous constructs. When -e or -f is present, the lone positional
+// is a file (the script came from the option), so the parent's rule
+// would mis-screen it -- overridePositional turns it off and the
+// option's own positional adds an ifReadable check on the file.
+"sed": {
+  "decision": "allow",
+  "options": {
+    "-e": {
+      "decision": "allow",
+      "values": { /* danger-pattern check against the script */ },
+      "overridePositional": true,
+      "positional": {
+        "*": { "if": "readable", "then": "allow", "else": "deny" }
+      }
+    }
+  },
+  "positional": {
+    "1": [ { "decision": "allow", "values": { /* script danger check */ } } ],
+    "2": [
+      { "decision": "allow", "values": { /* script danger check */ } },
+      { "if": "readable", "then": "allow", "else": "deny" }
+    ]
+  }
+}
+```
+
+Notes:
+
+- `overridePositional: true` with no `positional` field on the
+  flag/option simply suppresses the parent's `positional` -- the
+  flag/option's positional contribution to the merge is empty. Useful
+  when a flag/option fundamentally invalidates any parent-level
+  positional check (rare).
+- Both flag shapes (`{ "decision": ... }` and `{ "positional": ... }`)
+  accept `overridePositional`. The bare string form (`"-r": "deny"`)
+  does not -- there's no object on which to set the field. A
+  decision-form flag with override but no `positional` simply
+  suppresses the parent for the merge while contributing its own
+  decision normally.
+- The option's `values` / `checkFile` checks against the option's own
+  *value* are independent of `overridePositional`; they always run.
 
 ### Value lookup and `isPattern`
 

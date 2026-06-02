@@ -246,6 +246,10 @@ pub struct FlagEntry {
     pub kind: FlagKind,
     pub force: bool,
     pub aliases: Vec<String>,
+    /// When true and this flag is present, the parent node's `positional`
+    /// rule is skipped. Only meaningful when `kind` is `FlagKind::Positional`
+    /// (otherwise the flag contributes no positional overlay to begin with).
+    pub override_positional: bool,
 }
 
 #[derive(Debug)]
@@ -272,6 +276,8 @@ impl<'de> Deserialize<'de> for FlagEntry {
                 force: bool,
                 #[serde(default)]
                 aliases: Vec<String>,
+                #[serde(default, rename = "overridePositional")]
+                override_positional: bool,
             },
             WithPositional {
                 positional: WildcardMap<PositionalDef>,
@@ -279,6 +285,8 @@ impl<'de> Deserialize<'de> for FlagEntry {
                 force: bool,
                 #[serde(default)]
                 aliases: Vec<String>,
+                #[serde(default, rename = "overridePositional")]
+                override_positional: bool,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -286,24 +294,29 @@ impl<'de> Deserialize<'de> for FlagEntry {
                 kind: FlagKind::Decision(decision),
                 force: false,
                 aliases: vec![],
+                override_positional: false,
             }),
             Raw::WithDecision {
                 decision,
                 force,
                 aliases,
+                override_positional,
             } => Ok(FlagEntry {
                 kind: FlagKind::Decision(decision),
                 force,
                 aliases,
+                override_positional,
             }),
             Raw::WithPositional {
                 positional,
                 force,
                 aliases,
+                override_positional,
             } => Ok(FlagEntry {
                 kind: FlagKind::Positional(positional),
                 force,
                 aliases,
+                override_positional,
             }),
         }
     }
@@ -325,6 +338,17 @@ pub struct OptionEntry {
     /// contents are read and matched against `check_file.values` using the
     /// same exact/pattern/wildcard rules as a normal value lookup.
     pub check_file: Option<FileCheck>,
+    /// Per-positional-count rules applied to args appearing after this
+    /// option's value (e.g., `sed -e EXPR file1 file2` — the positionals
+    /// are the files). Evaluated in addition to the parent node's
+    /// `positional` unless `override_positional` is set.
+    pub positional: Option<WildcardMap<PositionalDef>>,
+    /// When true and this option is present, the parent node's `positional`
+    /// rule is skipped — only this option's `positional` (if any) applies.
+    /// Useful when the option changes what the positionals mean: e.g.
+    /// `sed -e SCRIPT FILE` makes the lone positional a file rather than a
+    /// script, so the parent's script-pattern check shouldn't fire.
+    pub override_positional: bool,
 }
 
 /// Opt-in companion to `OptionEntry.values` (and the analogous positional
@@ -373,6 +397,10 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 values: Option<WildcardMap<DecisionSpec>>,
                 #[serde(default, rename = "checkFile")]
                 check_file: Option<FileCheck>,
+                #[serde(default)]
+                positional: Option<WildcardMap<PositionalDef>>,
+                #[serde(default, rename = "overridePositional")]
+                override_positional: bool,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -383,6 +411,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 allow_expansions: false,
                 values: None,
                 check_file: None,
+                positional: None,
+                override_positional: false,
             }),
             Raw::BareConditional(cond) => Ok(OptionEntry {
                 decision: Decision::Ask,
@@ -398,6 +428,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                     })),
                 }),
                 check_file: None,
+                positional: None,
+                override_positional: false,
             }),
             Raw::Full {
                 decision,
@@ -406,6 +438,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 allow_expansions,
                 values,
                 check_file,
+                positional,
+                override_positional,
             } => Ok(OptionEntry {
                 decision,
                 force,
@@ -413,6 +447,8 @@ impl<'de> Deserialize<'de> for OptionEntry {
                 allow_expansions,
                 values,
                 check_file,
+                positional,
+                override_positional,
             }),
         }
     }
@@ -563,6 +599,7 @@ mod tests {
             kind: FlagKind::Decision(decision),
             force: false,
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            override_positional: false,
         }
     }
 

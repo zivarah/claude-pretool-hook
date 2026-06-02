@@ -371,16 +371,17 @@ fn bash_option_no_values_dict() {
 fn bash_option_not_reported_as_unknown_flag() {
     // sed has both flags and options; --expression is in options, not flags.
     // The flags loop must skip it rather than reporting it as unknown.
-    assert_decision(
-        &bash_input("sed --expression 's/foo/bar/' /tmp/file.txt"),
-        "allow",
-    );
+    let input = write_tmp_file("");
+    let cmd = format!("sed --expression 's/foo/bar/' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
 }
 
 #[test]
 fn bash_option_alias_not_reported_as_unknown_flag() {
     // sed -e is an alias for --expression (in options, not flags).
-    assert_decision(&bash_input("sed -e 's/foo/bar/' /tmp/file.txt"), "allow");
+    let input = write_tmp_file("");
+    let cmd = format!("sed -e 's/foo/bar/' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
 }
 
 // =============================================================================
@@ -401,8 +402,8 @@ fn bash_positional_count_2_ask() {
 
 #[test]
 fn bash_positional_wildcard_count() {
-    // sed a b c → "*" wildcard positional is allow
-    assert_decision(&bash_input("sed a b c"), "allow");
+    // awk a b c → "*" wildcard positional is allow
+    assert_decision(&bash_input("awk a b c"), "allow");
 }
 
 // =============================================================================
@@ -887,55 +888,114 @@ fn bash_awk_f_missing_file_denies() {
 
 #[test]
 fn bash_sed_e_safe_substitution_allow() {
-    assert_decision(&bash_input("sed -e 's/foo/bar/' /tmp/file.txt"), "allow");
+    let input = write_tmp_file("");
+    let cmd = format!("sed -e 's/foo/bar/' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
 }
 
 #[test]
 fn bash_sed_e_exec_command_asks() {
     // The `e` sed command executes the pattern space as a shell command.
-    assert_decision(
-        &bash_input("sed -e 'e cat /etc/passwd' /tmp/file.txt"),
-        "ask",
-    );
+    let input = write_tmp_file("");
+    let cmd = format!("sed -e 'e cat /etc/passwd' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
 }
 
 #[test]
 fn bash_sed_e_substitution_e_flag_asks() {
     // s///e flag executes the substitution result as a shell command.
-    assert_decision(&bash_input("sed -e 's/foo/bar/e' /tmp/file.txt"), "ask");
+    let input = write_tmp_file("");
+    let cmd = format!("sed -e 's/foo/bar/e' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
 }
 
 #[test]
 fn bash_sed_e_write_command_asks() {
     // The `w` sed command writes pattern space to a file (other than stdout).
-    assert_decision(&bash_input("sed -e '1w /etc/passwd' /tmp/file.txt"), "ask");
+    let input = write_tmp_file("");
+    let cmd = format!("sed -e '1w /etc/passwd' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
 }
 
 // --- sed positional script (no -e) ---
 
 #[test]
 fn bash_sed_positional_safe_script_allow() {
-    assert_decision(&bash_input("sed 's/foo/bar/' /tmp/file.txt"), "allow");
+    let input = write_tmp_file("");
+    let cmd = format!("sed 's/foo/bar/' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "allow");
 }
 
 #[test]
 fn bash_sed_positional_exec_command_asks() {
-    assert_decision(&bash_input("sed '1e cat /etc/passwd' /tmp/file.txt"), "ask");
+    let input = write_tmp_file("");
+    let cmd = format!("sed '1e cat /etc/passwd' {}", input.path().display());
+    assert_decision(&bash_input(&cmd), "ask");
+}
+
+#[test]
+fn bash_sed_e_with_unreadable_file_path_denies() {
+    // overridePositional skips the parent's positional rule, but the option's
+    // own positional overlay (ifReadable) still runs against the file arg.
+    // A path blocked by the read globs → ifReadable → deny.
+    assert_decision(&bash_input("sed -e 's/foo/bar/' /tmp/app.secret"), "deny");
+}
+
+#[test]
+fn bash_sed_e_with_file_path_matching_danger_regex_allow() {
+    // When -e carries the script, the lone positional is the input file.
+    // The file path shouldn't be screened against script-danger patterns
+    // since the script came from -e. Uses a deep nested path that the
+    // s/// danger regex would match if it were applied to the file slot.
+    let dir = tempfile::TempDir::new().expect("create tmp dir");
+    let nested = dir.path().join("things/foo/bar");
+    std::fs::create_dir_all(&nested).expect("create dirs");
+    let file = nested.join("home.txt");
+    std::fs::write(&file, "").expect("write file");
+    let cmd = format!("sed -e 's/foo/bar/' {}", file.display());
+    assert_decision(&bash_input(&cmd), "allow");
+}
+
+#[test]
+fn bash_sed_positional_file_path_not_screened_as_script() {
+    // Regression: the danger regex `s/[^/]+/[^/]+/[a-z]*[ew]` can spuriously
+    // match deep file paths. `/<tmp>/things/foo/bar/home.txt` contains the
+    // substring `s/foo/bar/home` (s + two `/`-separated segments + a third
+    // segment ending in "e"), which matches the substitution-with-e/w-flag
+    // pattern. The script (positional 1, "44,72p") is safe; the file-path
+    // positional shouldn't be screened against script-danger regexes.
+    let dir = tempfile::TempDir::new().expect("create tmp dir");
+    let nested = dir.path().join("things/foo/bar");
+    std::fs::create_dir_all(&nested).expect("create dirs");
+    let file = nested.join("home.txt");
+    std::fs::write(&file, "").expect("write file");
+    let cmd = format!("sed -n 44,72p {}", file.display());
+    assert_decision(&bash_input(&cmd), "allow");
 }
 
 // --- sed -f (file-contents patterns) ---
 
 #[test]
 fn bash_sed_f_safe_script_file_allow() {
-    let tmp = write_tmp_file("s/foo/bar/");
-    let cmd = format!("sed -f {} /tmp/file.txt", tmp.path().display());
+    let script = write_tmp_file("s/foo/bar/");
+    let input = write_tmp_file("");
+    let cmd = format!(
+        "sed -f {} {}",
+        script.path().display(),
+        input.path().display()
+    );
     assert_decision(&bash_input(&cmd), "allow");
 }
 
 #[test]
 fn bash_sed_f_evil_script_file_asks() {
-    let tmp = write_tmp_file("1e rm -rf /\ns/a/b/");
-    let cmd = format!("sed -f {} /tmp/file.txt", tmp.path().display());
+    let script = write_tmp_file("1e rm -rf /\ns/a/b/");
+    let input = write_tmp_file("");
+    let cmd = format!(
+        "sed -f {} {}",
+        script.path().display(),
+        input.path().display()
+    );
     assert_decision(&bash_input(&cmd), "ask");
 }
 

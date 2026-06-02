@@ -407,6 +407,11 @@ fn evaluate_node(
     let mut path_checks: Vec<PathCheck> = Vec::new();
     let pos_args = extract_positionals(args, node.options.as_ref());
 
+    // Tracks whether any matched flag or option requested
+    // `overridePositional`, in which case the parent node's `positional`
+    // rule is skipped during the merge below.
+    let mut positional_overridden = false;
+
     // Flags
     if let Some(flags) = &node.flags {
         for arg in &args[1..] {
@@ -434,6 +439,9 @@ fn evaluate_node(
                     &mut judgments,
                     &mut path_checks,
                 );
+                if entry.override_positional {
+                    positional_overridden = true;
+                }
             } else {
                 judgments.push(Judgment::new(
                     Decision::Ask,
@@ -443,35 +451,58 @@ fn evaluate_node(
         }
     }
 
-    // Options (flags that take values)
+    // Options (flags that take values). Also collects any per-option
+    // `positional` overlays and tracks whether any matched option opted
+    // into `overridePositional` (skipping the parent's positional rule).
+    let mut option_positional_judgments: Vec<Judgment> = Vec::new();
+    let mut option_positional_path_checks: Vec<PathCheck> = Vec::new();
     if let Some(options) = &node.options {
         let mut i = 1;
         while i < args.len() {
             if args[i].starts_with('-') {
-                if let Some(entry) = lookup_with_alias(&args[i], options) {
-                    // Space-separated form: --output /tmp/file
-                    let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
-                    evaluate_option_value(
-                        entry,
-                        &args[i],
-                        value,
-                        cmd_str,
-                        eval_ctx,
-                        &mut judgments,
-                        &mut path_checks,
-                    );
-                } else if let Some((name, eq_value)) = split_option_eq(&args[i]) {
-                    if let Some(entry) = lookup_with_alias(name, options) {
-                        // Equals form: --option=value
+                let matched_entry: Option<(&OptionEntry, &str)> =
+                    if let Some(entry) = lookup_with_alias(&args[i], options) {
+                        let value = args.get(i + 1).map(|s| s.as_str()).unwrap_or("");
                         evaluate_option_value(
                             entry,
-                            name,
-                            eq_value,
+                            &args[i],
+                            value,
                             cmd_str,
                             eval_ctx,
                             &mut judgments,
                             &mut path_checks,
                         );
+                        Some((entry, args[i].as_str()))
+                    } else if let Some((name, eq_value)) = split_option_eq(&args[i]) {
+                        if let Some(entry) = lookup_with_alias(name, options) {
+                            evaluate_option_value(
+                                entry,
+                                name,
+                                eq_value,
+                                cmd_str,
+                                eval_ctx,
+                                &mut judgments,
+                                &mut path_checks,
+                            );
+                            Some((entry, name))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                if let Some((entry, name)) = matched_entry {
+                    if let Some(pos_defs) = &entry.positional {
+                        let context = format!("option '{name}' positional");
+                        let (pj, pc) = collect_positional_decisions(
+                            pos_defs, &pos_args, cmd_str, eval_ctx, &context,
+                        );
+                        option_positional_judgments.extend(pj);
+                        option_positional_path_checks.extend(pc);
+                    }
+                    if entry.override_positional {
+                        positional_overridden = true;
                     }
                 }
             }
@@ -487,14 +518,18 @@ fn evaluate_node(
         ));
     }
 
-    // Positional (ordered, keyed by count)
-    let (positional_judgments, positional_path_checks) = if let Some(positional) = &node.positional
-    {
+    // Positional (ordered, keyed by count). Skipped when a matched option
+    // requested `overridePositional` — in that case only the option's own
+    // positional overlay (collected above) contributes.
+    let (positional_judgments, positional_path_checks) = if positional_overridden {
+        (Vec::new(), Vec::new())
+    } else if let Some(positional) = &node.positional {
         collect_positional_decisions(positional, &pos_args, cmd_str, eval_ctx, "positional")
     } else {
         (Vec::new(), Vec::new())
     };
     path_checks.extend(positional_path_checks);
+    path_checks.extend(option_positional_path_checks);
 
     // cwdCheck — conditional decision applied to the working directory
     if let Some(cwd_node) = &node.cwd_check {
@@ -512,6 +547,7 @@ fn evaluate_node(
     let all_judgments: Vec<Judgment> = judgments
         .iter()
         .chain(positional_judgments.iter())
+        .chain(option_positional_judgments.iter())
         .cloned()
         .collect();
 
@@ -1840,10 +1876,11 @@ mod tests {
 
     #[test]
     fn positional_wildcard_count() {
-        // sed 's/a/b/' file1 file2 file3 → "*" positional is allow, applies to all
-        // (sed also has "1" with a conditional, but 3 args doesn't match "1",
-        // so the wildcard is used and it's a static "allow")
-        let result = eval(&["sed", "a", "b", "c"]);
+        // awk 'BEGIN' file1 file2 → "*" positional is allow + value-check,
+        // applies to all positionals when no specific count rule matches.
+        // (sed no longer uses a single "*" allow — its positionals are
+        // split into "1"/"2"/"*" slots with "*" = "ask".)
+        let result = eval(&["awk", "a", "b", "c"]);
         assert_eq!(decision(&result), Decision::Allow);
     }
 
@@ -2214,5 +2251,158 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Positional overlay + overridePositional interactions ----------------
+    //
+    // A synthetic command "cmd" with one positional. Decisions are chosen so
+    // the merge outcome reveals which overlays actually contributed:
+    //
+    //   parent positional ("*" = "ask")
+    //   --merge-flag overlay  ("*" = "deny"),  no override
+    //   --override-flag overlay ("*" = "allow"), overridePositional: true
+    //   --merge-opt overlay   ("*" = "deny"),  no override
+    //   --override-opt overlay ("*" = "allow"), overridePositional: true
+    //
+    // Strictest wins (deny > ask > allow), so:
+    //   - "ask" outcome  => parent contributed AND no "deny" overlay fired
+    //   - "deny" outcome => some non-override overlay fired (its "deny" beat
+    //                       anything else)
+    //   - "allow" outcome => parent was skipped AND no "deny" overlay fired
+    //                        (every contributor said "allow")
+    const LAYERING_RULES: &str = r#"{
+        "cmd": {
+            "decision": "allow",
+            "flags": {
+                "--merge-flag": {
+                    "positional": { "*": "deny" }
+                },
+                "--override-flag": {
+                    "positional": { "*": "allow" },
+                    "overridePositional": true
+                },
+                "--override-only": {
+                    "decision": "allow",
+                    "overridePositional": true
+                }
+            },
+            "options": {
+                "--merge-opt": {
+                    "decision": "allow",
+                    "positional": { "*": "deny" }
+                },
+                "--override-opt": {
+                    "decision": "allow",
+                    "positional": { "*": "allow" },
+                    "overridePositional": true
+                },
+                "--override-opt-empty": {
+                    "decision": "allow",
+                    "overridePositional": true
+                }
+            },
+            "positional": { "*": "ask" }
+        }
+    }"#;
+
+    #[test]
+    fn layering_parent_only_no_overlay() {
+        // No flags/options matched → parent rule alone applies → ask.
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "x"]);
+        assert_eq!(decision(&result), Decision::Ask);
+    }
+
+    #[test]
+    fn layering_flag_overlay_merges_with_parent() {
+        // --merge-flag overlay (deny) + parent (ask) → strictest = deny.
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "--merge-flag", "x"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn layering_flag_override_skips_parent() {
+        // --override-flag overlay (allow) + parent skipped → allow.
+        // (If parent's "ask" still contributed, result would be ask.)
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "--override-flag", "x"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn layering_option_overlay_merges_with_parent() {
+        // --merge-opt overlay (deny) + parent (ask) → deny.
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "--merge-opt", "v", "x"]);
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn layering_option_override_skips_parent() {
+        // --override-opt overlay (allow) + parent skipped → allow.
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "--override-opt", "v", "x"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn layering_override_does_not_suppress_other_overlays() {
+        // --override-flag (allow, override) + --merge-flag (deny, no override).
+        // Override skips the parent, but the sibling overlay still fires →
+        // result is deny (strictest wins among the two overlays).
+        let result = eval_with_commands(
+            LAYERING_RULES,
+            &["cmd", "--override-flag", "--merge-flag", "x"],
+        );
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn layering_flag_override_with_option_merge_overlay() {
+        // --override-flag suppresses parent; --merge-opt (deny) still applies.
+        // Parent skipped + overlays { allow, deny } → deny.
+        let result = eval_with_commands(
+            LAYERING_RULES,
+            &["cmd", "--override-flag", "--merge-opt", "v", "x"],
+        );
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn layering_option_override_with_flag_merge_overlay() {
+        // Symmetric: --override-opt suppresses parent; --merge-flag still
+        // applies. Parent skipped + overlays { deny, allow } → deny.
+        let result = eval_with_commands(
+            LAYERING_RULES,
+            &["cmd", "--merge-flag", "--override-opt", "v", "x"],
+        );
+        assert_eq!(decision(&result), Decision::Deny);
+    }
+
+    #[test]
+    fn layering_two_overrides_stack() {
+        // Both --override-flag and --override-opt skip the parent (only once);
+        // their two "allow" overlays both contribute → allow.
+        let result = eval_with_commands(
+            LAYERING_RULES,
+            &["cmd", "--override-flag", "--override-opt", "v", "x"],
+        );
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn layering_override_with_no_positional_field_flag() {
+        // --override-only declares overridePositional but no positional rule.
+        // Parent is suppressed, no other overlays present → no positional
+        // judgments contribute. The command-level decision "allow" wins.
+        let result = eval_with_commands(LAYERING_RULES, &["cmd", "--override-only", "x"]);
+        assert_eq!(decision(&result), Decision::Allow);
+    }
+
+    #[test]
+    fn layering_override_with_no_positional_field_option() {
+        // Same shape for an option: --override-opt-empty has override but no
+        // positional. Parent suppressed, no overlay contributes → allow.
+        let result = eval_with_commands(
+            LAYERING_RULES,
+            &["cmd", "--override-opt-empty", "v", "x"],
+        );
+        assert_eq!(decision(&result), Decision::Allow);
     }
 }
