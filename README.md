@@ -533,3 +533,66 @@ When `requireReadable` is true on `write`, a path must pass the read patterns
 before the write patterns are checked. This means a denylist entry on `read`
 (e.g., `!**/*.secret*`) automatically also blocks writes to that path, even if
 `glob_patterns` would otherwise allow it.
+
+## Using with OpenAI Codex
+
+The same binary and the same rules file also work as an [OpenAI Codex][2]
+`PreToolUse` hook. Codex's native hook contract closely mirrors Claude Code's:
+it sends nearly the same stdin schema, so no separate build is needed. Tool
+dispatch is keyed on the `tool_name` field in the payload, not on which agent
+invoked the hook.
+
+The hook detects a Codex caller automatically via the Codex-only `turn_id`
+field, so no flag or extra configuration is required.
+
+[2]: https://developers.openai.com/codex/hooks
+
+### Enabling
+
+Codex hooks are off by default and must be opted into with
+`[features].codex_hooks = true` in `~/.codex/config.toml`, then registered under
+`[[hooks.PreToolUse]]`. With the home-manager module, set
+`programs.claude-pretool-hook.configureCodexHook = true` to generate both.
+Equivalent manual config:
+
+```toml
+[features]
+codex_hooks = true
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/path/to/claude-pretool-hook-wrapped"   # wrapper that adds --rules
+```
+
+**Trust step:** on first use -- and again whenever the command's path changes
+(e.g. after a Nix rebuild) -- Codex prompts you to review and trust the hook.
+When managing via nix, this is somewhat problematic as the approval attempts to
+modify the readonly config file managed by nix. You can use the following to
+automatically trust the hook:
+
+```nix
+let
+  codexHookKey = "${config.home.homeDirectory}/.codex/config.toml:pre_tool_use:0:0";
+  codexHookIdentity = {
+    event_name = "pre_tool_use";
+    matcher = ".*";
+    hooks = [
+      {
+        type = "command";
+        command = config.programs.claude-pretool-hook.wrappedCommand;
+        timeout = 600;
+        async = false;
+      }
+    ];
+  };
+  codexHookHash = "sha256:${builtins.hashString "sha256" (builtins.toJSON codexHookIdentity)}";
+in
+{
+  programs.codex.settings.hooks.state.${codexHookKey}.trusted_hash = codexHookHash;
+}
+```
+
+But this may be fragile.

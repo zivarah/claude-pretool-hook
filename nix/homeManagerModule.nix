@@ -37,9 +37,7 @@ let
     || cfg.rules.fileAccess.write.globPatterns != [ ]
     || cfg.rules.fileAccess.write.requireReadable;
 
-  generatedRulesFile = pkgs.writeText "claude-pretool-hook-rules.json" (
-    builtins.toJSON cleanedRules
-  );
+  generatedRulesFile = pkgs.writeText "claude-pretool-hook-rules.json" (builtins.toJSON cleanedRules);
 
   wrappedScript = pkgs.writeShellScriptBin "claude-pretool-hook-wrapped" ''
     exec ${lib.getExe cfg.package} --rules ${cfg.rulesFile}
@@ -77,6 +75,16 @@ in
 
         Requires the `programs.claude-code` home-manager module to be
         loaded; otherwise the assignment errors at evaluation time.
+      '';
+    };
+
+    configureCodexHook = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        When true, enable `[features].hooks` and append a PreToolUse entry to
+        `programs.codex.settings.hooks.PreToolUse`. This lets the same rules
+        govern OpenAI Codex tool calls.
       '';
     };
 
@@ -124,6 +132,22 @@ in
             ];
           }
         ];
+      })
+      (lib.mkIf cfg.configureCodexHook {
+        programs.codex.settings = {
+          features.hooks = true;
+          hooks.PreToolUse = [
+            {
+              matcher = ".*";
+              hooks = [
+                {
+                  type = "command";
+                  command = lib.getExe wrappedScript;
+                }
+              ];
+            }
+          ];
+        };
       })
     ]
   );

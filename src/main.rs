@@ -23,7 +23,9 @@ use crate::{
     decision::{
         Condition, ConditionalBranch, ConditionalDecisionNode, DecisionNode, StaticDecisionNode,
     },
-    input::{EditInput, GlobInput, GrepInput, NotebookEditInput, ReadInput, WriteInput},
+    input::{
+        ApplyPatchInput, EditInput, GlobInput, GrepInput, NotebookEditInput, ReadInput, WriteInput,
+    },
 };
 
 #[derive(Parser)]
@@ -53,13 +55,17 @@ fn main() {
         }
     };
 
-    // Read hook input from stdin.
+    // Read hook input from stdin.  The output format depends on the caller:
+    // Codex acts on a top-level `decision` field, not Claude's
+    // `hookSpecificOutput.permissionDecision`, so detect it after parsing.
     let mut input = String::new();
+    let mut is_codex = false;
     let response = if let Err(e) = std::io::stdin().read_to_string(&mut input) {
         create_response(Decision::Ask, &format!("failed to read stdin: {e}"))
     } else {
         match serde_json::from_str::<HookInput>(&input) {
             Ok(hook_input) => {
+                is_codex = hook_input.common.is_codex();
                 let cwd = PathBuf::from(&hook_input.common.cwd);
                 let project_dir = env::var("CLAUDE_PROJECT_DIR").ok();
                 let compiled_fa = match path::CompiledFileAccess::compile(
@@ -80,7 +86,7 @@ fn main() {
         }
     };
 
-    print_response(response);
+    print_response(&response, is_codex);
 }
 
 #[derive(Serialize)]
@@ -94,18 +100,33 @@ pub struct HookSpecificOutput {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookOutput {
+    /// Canonical decision, retained to select the Codex output form.  Not part
+    /// of the serialized Claude Code wire format.
+    #[serde(skip)]
+    pub decision: Decision,
     pub hook_specific_output: HookSpecificOutput,
 }
 
-fn print_response(output: HookOutput) {
-    println!(
-        "{}",
-        serde_json::to_string(&output).expect("response serialization failed")
-    );
+/// Serialize the response for the detected caller.
+///
+/// Both Claude Code and Codex accept the `hookSpecificOutput` form with
+/// `permissionDecision: "deny"`, so denials serialize identically. Codex's
+/// hook channel, however, has no way to return a plain "allow" (its
+/// `permissionDecision: "allow"` requires an `updatedInput` rewrite) or an
+/// "ask", so for those decisions under Codex the hook abstains with an empty
+/// object, deferring to Codex's own approval flow.
+fn print_response(output: &HookOutput, is_codex: bool) {
+    let json = if is_codex && output.decision != Decision::Deny {
+        "{}".to_owned()
+    } else {
+        serde_json::to_string(output).expect("response serialization failed")
+    };
+    println!("{json}");
 }
 
 fn create_response(decision: Decision, reason: &str) -> HookOutput {
     HookOutput {
+        decision,
         hook_specific_output: HookSpecificOutput {
             hook_event_name: "PreToolUse".to_owned(),
             permission_decision: decision.as_str().to_owned(),
@@ -145,6 +166,9 @@ fn dispatch(
             let path = path.as_deref().unwrap_or(cwd_str);
             handle_file_check(path, rules.tools.grep.as_ref(), fa, cwd)?
         }
+        ToolInput::ApplyPatch(input) => {
+            handle_apply_patch(input, rules.tools.edit.as_ref(), fa, cwd)?
+        }
         _ => {
             let decision = rules.tools.other.get(input.tool.name());
             match decision {
@@ -177,6 +201,39 @@ fn handle_file_check(
         }
     };
     Ok(create_response(decision, &reason))
+}
+
+/// Evaluate Codex's `apply_patch` by routing every file the patch writes to
+/// through the same conditional node used for `Edit`/`Write`, then merging the
+/// per-path decisions (strictest wins).  An unparseable patch fails safe to
+/// `ask` rather than silently allowing an unexamined change.
+fn handle_apply_patch(
+    input: &ApplyPatchInput,
+    node: Option<&DecisionNode>,
+    fa: &path::CompiledFileAccess,
+    cwd: &Path,
+) -> anyhow::Result<HookOutput> {
+    let Some(node) = node else {
+        return Ok(create_response(Decision::Ask, "no rules for apply_patch"));
+    };
+    let paths = input.affected_paths();
+    if paths.is_empty() {
+        return Ok(create_response(
+            Decision::Ask,
+            "could not determine files affected by apply_patch",
+        ));
+    }
+
+    let mut decisions = Vec::with_capacity(paths.len());
+    let mut reasons = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let decision = path::resolve_conditional(node, path, fa, cwd)
+            .with_context(|| format!("resolving apply_patch path '{path}'"))?;
+        reasons.push(format!("file '{path}' {}", decision.description()));
+        decisions.push(decision);
+    }
+
+    Ok(create_response(merge(&decisions), &reasons.join("; ")))
 }
 
 fn handle_bash(

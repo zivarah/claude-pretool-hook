@@ -17,6 +17,18 @@ pub struct CommonInput {
     pub permission_mode: Option<String>,
     pub hook_event_name: String,
     pub tool_use_id: Option<String>,
+    /// Codex extension identifying the active turn.  Claude Code never sends
+    /// it, so its presence is used to detect a Codex caller and select the
+    /// output format Codex acts on.
+    pub turn_id: Option<String>,
+}
+
+impl CommonInput {
+    /// Whether the payload originated from OpenAI Codex rather than Claude
+    /// Code, detected via the Codex-only `turn_id` field.
+    pub fn is_codex(&self) -> bool {
+        self.turn_id.is_some()
+    }
 }
 
 /// Additional fields present when the hook fires inside a subagent.
@@ -128,6 +140,42 @@ pub struct AskUserQuestionInput {
     pub answers: Option<HashMap<String, String>>,
 }
 
+/// Input for Codex's `apply_patch` tool.  The whole change set is carried as a
+/// single patch-envelope string; the exact field name varies across Codex
+/// versions, so several known spellings are accepted.
+#[derive(Debug, Deserialize)]
+pub struct ApplyPatchInput {
+    #[serde(alias = "patch", alias = "changes", alias = "content", alias = "diff")]
+    pub input: String,
+}
+
+impl ApplyPatchInput {
+    /// Extract the set of file paths the patch writes to by scanning the
+    /// envelope's `*** Add File:`, `*** Update File:`, `*** Delete File:`, and
+    /// `*** Move to:` header lines.  A rename produces both the original
+    /// (`Update File`) and the destination (`Move to`) paths.
+    pub fn affected_paths(&self) -> Vec<String> {
+        const PREFIXES: [&str; 4] = [
+            "*** Add File:",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Move to:",
+        ];
+        self.input
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                PREFIXES.iter().find_map(|prefix| {
+                    line.strip_prefix(prefix)
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_owned)
+                })
+            })
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ToolInput enum
 // ---------------------------------------------------------------------------
@@ -145,6 +193,8 @@ pub enum ToolInput {
     WebSearch(WebSearchInput),
     Agent(AgentToolInput),
     AskUserQuestion(AskUserQuestionInput),
+    /// Codex's file-editing tool (no Claude Code equivalent).
+    ApplyPatch(ApplyPatchInput),
     /// Forward-compatibility catch-all for tools not listed above.
     Unknown {
         tool_name: String,
@@ -166,6 +216,7 @@ impl ToolInput {
             ToolInput::WebSearch(_) => "WebSearch",
             ToolInput::Agent(_) => "Agent",
             ToolInput::AskUserQuestion(_) => "AskUserQuestion",
+            ToolInput::ApplyPatch(_) => "apply_patch",
             ToolInput::Unknown { tool_name, .. } => tool_name,
         }
     }
@@ -201,6 +252,7 @@ impl<'de> Deserialize<'de> for HookInput {
             #[serde(default)]
             hook_event_name: String,
             tool_use_id: Option<String>,
+            turn_id: Option<String>,
             agent_id: Option<String>,
             agent_type: Option<String>,
             #[serde(default)]
@@ -218,6 +270,7 @@ impl<'de> Deserialize<'de> for HookInput {
             permission_mode: flat.permission_mode,
             hook_event_name: flat.hook_event_name,
             tool_use_id: flat.tool_use_id,
+            turn_id: flat.turn_id,
         };
 
         let agent = if flat.agent_id.is_some() || flat.agent_type.is_some() {
@@ -282,6 +335,7 @@ fn parse_tool_input(
         "WebSearch" => try_parse!(ToolInput::WebSearch),
         "Agent" => try_parse!(ToolInput::Agent),
         "AskUserQuestion" => try_parse!(ToolInput::AskUserQuestion),
+        "apply_patch" => try_parse!(ToolInput::ApplyPatch),
         _ => {}
     }
 
