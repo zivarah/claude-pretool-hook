@@ -55,17 +55,17 @@ fn main() {
         }
     };
 
-    // Read hook input from stdin.  The output format depends on the caller:
-    // Codex acts on a top-level `decision` field, not Claude's
-    // `hookSpecificOutput.permissionDecision`, so detect it after parsing.
+    // Read hook input from stdin.  How the decision is serialized depends on
+    // the caller, which is only known once the payload parses, so the output
+    // context is filled in after parsing and left at its default otherwise.
     let mut input = String::new();
-    let mut is_codex = false;
+    let mut output_ctx = OutputContext::default();
     let response = if let Err(e) = std::io::stdin().read_to_string(&mut input) {
         create_response(Decision::Ask, &format!("failed to read stdin: {e}"))
     } else {
         match serde_json::from_str::<HookInput>(&input) {
             Ok(hook_input) => {
-                is_codex = hook_input.common.is_codex();
+                output_ctx.is_codex = hook_input.common.is_codex();
                 let cwd = PathBuf::from(&hook_input.common.cwd);
                 let project_dir = env::var("CLAUDE_PROJECT_DIR").ok();
                 let compiled_fa = match path::CompiledFileAccess::compile(
@@ -86,7 +86,23 @@ fn main() {
         }
     };
 
-    print_response(&response, is_codex);
+    print_response(&response, &output_ctx);
+}
+
+/// Caller-derived context that shapes how a decision is serialized.  Defaults
+/// to the plain Claude Code behavior, which is also the safe fallback when the
+/// payload cannot be parsed.
+#[derive(Default)]
+struct OutputContext {
+    is_codex: bool,
+}
+
+impl OutputContext {
+    /// Whether to withhold the decision entirely, leaving the tool call to the
+    /// caller's own approval flow.
+    fn abstains_from(&self, decision: Decision) -> bool {
+        self.is_codex && decision != Decision::Deny
+    }
 }
 
 #[derive(Serialize)]
@@ -115,8 +131,8 @@ pub struct HookOutput {
 /// `permissionDecision: "allow"` requires an `updatedInput` rewrite) or an
 /// "ask", so for those decisions under Codex the hook abstains with an empty
 /// object, deferring to Codex's own approval flow.
-fn print_response(output: &HookOutput, is_codex: bool) {
-    let json = if is_codex && output.decision != Decision::Deny {
+fn print_response(output: &HookOutput, ctx: &OutputContext) {
+    let json = if ctx.abstains_from(output.decision) {
         "{}".to_owned()
     } else {
         serde_json::to_string(output).expect("response serialization failed")
