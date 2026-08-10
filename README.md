@@ -19,6 +19,10 @@ the tool name and input JSON from stdin, evaluates it against a rules JSON file
 - **deny** -- tool call is blocked with an explanation
 - **ask** -- user is prompted to approve or reject
 
+The hook can also abstain, returning no decision so the caller's own approval
+flow applies. See [`deferAskInAutoMode`](#deferaskinautomode) and
+[Using with OpenAI Codex](#using-with-openai-codex).
+
 ### Tool categories
 
 Tools are divided into two groups based on how they're evaluated:
@@ -234,9 +238,26 @@ The rules JSON has this top-level structure:
   "fileAccess": {
     "read": { "globPatterns": ["**", "!**/*.secret*"] },
     "write": { "globPatterns": ["/tmp/**"], "requireReadable": true }
-  }
+  },
+  "deferAskInAutoMode": false
 }
 ```
+
+### `deferAskInAutoMode`
+
+In Claude Code's **auto** permission mode, Claude decides for itself any tool
+call the permission rules leave unresolved. An "ask" from this hook
+short-circuits that and prompts you instead, which makes auto mode no less
+interactive than the default mode.
+
+Setting `"deferAskInAutoMode": true` (default `false`) will cause the hook to
+abstain from making a decision at all when running in claude's auto mode.
+"allow" and "deny" are still emitted. Every other permission mode is unaffected.
+
+The deferral covers implicit asks too (an unlisted command, an unmatched flag),
+not just rules that spell out `"ask"`, which is why it is opt-in. A payload the
+hook cannot parse still asks, since the permission mode is unknown at that
+point.
 
 ### Command node
 

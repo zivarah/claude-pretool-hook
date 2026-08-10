@@ -1,0 +1,13 @@
+{
+  "deferAskInAutoMode": true,
+  "tools": {
+    "Bash": {
+      "commands": {
+        "ls": "allow",
+        "sh": "ask",
+        "dd": "deny"
+      }
+    }
+  },
+  "fileAccess": {}
+}

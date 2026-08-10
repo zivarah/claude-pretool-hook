@@ -302,6 +302,17 @@ let
 in
 {
   options = {
+    deferAskInAutoMode = lib.mkOption {
+      default = false;
+      description = ''
+        When true and Claude Code is in "auto" permission mode, withhold
+        "ask" decisions so Claude's own judgment applies instead of
+        prompting. Explicit "allow" and "deny" decisions are still
+        reported. Has no effect in any other permission mode.
+      '';
+      type = lib.types.bool;
+    };
+
     tools = lib.mkOption {
       default = { };
       description = ''

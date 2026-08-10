@@ -3,10 +3,18 @@ use duct::cmd;
 /// Path to the test rules fixture, relative to the crate root.
 const TEST_RULES: &str = "tests/fixtures/test_rules.json";
 
+/// A minimal rules fixture with `deferAskInAutoMode` enabled.
+const DEFER_ASK_RULES: &str = "tests/fixtures/defer_ask_rules.json";
+
 /// Run the hook binary with the given JSON on stdin, returning raw stdout.
 fn run_hook_raw(input_json: &str) -> (i32, String) {
+    run_hook_raw_with_rules(TEST_RULES, input_json)
+}
+
+/// Run the hook binary against a specific rules file.
+fn run_hook_raw_with_rules(rules: &str, input_json: &str) -> (i32, String) {
     let bin = env!("CARGO_BIN_EXE_claude-pretool-hook");
-    let output = cmd!(bin, "--rules", TEST_RULES)
+    let output = cmd!(bin, "--rules", rules)
         .stdin_bytes(input_json.as_bytes())
         .stdout_capture()
         .stderr_capture()
@@ -1807,4 +1815,94 @@ fn claude_output_format_unchanged() {
         "stdout: {stdout}"
     );
     assert!(parsed.get("decision").is_none(), "stdout: {stdout}");
+}
+
+// =============================================================================
+// deferAskInAutoMode
+// =============================================================================
+
+/// A Bash invocation carrying an explicit Claude permission mode.
+fn bash_input_with_mode(command: &str, permission_mode: &str) -> String {
+    serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "hook_event_name": "PreToolUse",
+        "permission_mode": permission_mode
+    })
+    .to_string()
+}
+
+/// Assert the decision the defer-ask fixture produces, treating an abstain
+/// (empty object) as the distinct decision `""`.
+fn assert_defer_decision(input: &str, expected: &str) {
+    let (code, stdout) = run_hook_raw_with_rules(DEFER_ASK_RULES, input);
+    assert_eq!(code, 0, "expected exit 0, got {code}; stdout: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let decision = parsed
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(decision, expected, "stdout: {stdout}");
+}
+
+#[test]
+fn auto_mode_ask_abstains() {
+    // In auto mode with deferAskInAutoMode set, an "ask" is withheld so
+    // Claude's own judgment decides rather than the user being prompted.
+    assert_defer_decision(&bash_input_with_mode("sh", "auto"), "");
+}
+
+#[test]
+fn auto_mode_allow_still_reported() {
+    assert_defer_decision(&bash_input_with_mode("ls", "auto"), "allow");
+}
+
+#[test]
+fn auto_mode_deny_still_reported() {
+    assert_defer_decision(&bash_input_with_mode("dd", "auto"), "deny");
+}
+
+#[test]
+fn auto_mode_unknown_command_ask_abstains() {
+    // The implicit "ask" for an unlisted command defers just like an explicit
+    // one — otherwise deferral would only cover rules that spell out "ask".
+    assert_defer_decision(&bash_input_with_mode("nope", "auto"), "");
+}
+
+#[test]
+fn non_auto_modes_still_ask() {
+    // Deferral is scoped to auto mode; every other mode still prompts.
+    for mode in ["default", "plan", "acceptEdits", "bypassPermissions"] {
+        assert_defer_decision(&bash_input_with_mode("sh", mode), "ask");
+    }
+}
+
+#[test]
+fn missing_permission_mode_still_asks() {
+    // A payload without permission_mode is not auto mode.
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "sh" }
+    })
+    .to_string();
+    assert_defer_decision(&input, "ask");
+}
+
+#[test]
+fn auto_mode_asks_when_deferral_not_enabled() {
+    // The main fixture omits deferAskInAutoMode, so auto mode changes nothing.
+    assert_decision(&bash_input_with_mode("sh", "auto"), "ask");
+}
+
+#[test]
+fn unparseable_input_asks_even_in_auto_mode() {
+    // The permission mode is unknown when the payload does not parse, so the
+    // hook falls back to prompting rather than silently deferring.
+    let (code, stdout) = run_hook_raw_with_rules(DEFER_ASK_RULES, "{ not json");
+    assert_eq!(code, 0, "expected exit 0, got {code}");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        parsed["hookSpecificOutput"]["permissionDecision"], "ask",
+        "stdout: {stdout}"
+    );
 }

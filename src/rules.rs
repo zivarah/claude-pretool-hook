@@ -10,6 +10,11 @@ pub struct Rules {
     #[serde(default)]
     pub tools: ToolEntry,
     pub file_access: FileAccess,
+    /// When true and Claude Code is in "auto" permission mode, withhold `ask`
+    /// decisions so Claude's own judgment applies instead of a prompt.
+    /// Explicit allows and denies are still reported.
+    #[serde(default)]
+    pub defer_ask_in_auto_mode: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

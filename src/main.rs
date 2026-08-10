@@ -66,6 +66,8 @@ fn main() {
         match serde_json::from_str::<HookInput>(&input) {
             Ok(hook_input) => {
                 output_ctx.is_codex = hook_input.common.is_codex();
+                output_ctx.defer_ask =
+                    rules.defer_ask_in_auto_mode && hook_input.common.is_auto_mode();
                 let cwd = PathBuf::from(&hook_input.common.cwd);
                 let project_dir = env::var("CLAUDE_PROJECT_DIR").ok();
                 let compiled_fa = match path::CompiledFileAccess::compile(
@@ -95,13 +97,20 @@ fn main() {
 #[derive(Default)]
 struct OutputContext {
     is_codex: bool,
+    /// Claude Code is in "auto" permission mode and the rules opted into
+    /// deferring to it via `deferAskInAutoMode`.
+    defer_ask: bool,
 }
 
 impl OutputContext {
     /// Whether to withhold the decision entirely, leaving the tool call to the
     /// caller's own approval flow.
     fn abstains_from(&self, decision: Decision) -> bool {
-        self.is_codex && decision != Decision::Deny
+        match decision {
+            Decision::Deny => false,
+            Decision::Allow => self.is_codex,
+            Decision::Ask => self.is_codex || self.defer_ask,
+        }
     }
 }
 

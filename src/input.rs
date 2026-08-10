@@ -29,6 +29,12 @@ impl CommonInput {
     pub fn is_codex(&self) -> bool {
         self.turn_id.is_some()
     }
+
+    /// Whether Claude Code is in "auto" permission mode, where Claude judges
+    /// for itself any tool call the permission rules leave unresolved.
+    pub fn is_auto_mode(&self) -> bool {
+        self.permission_mode.as_deref() == Some("auto")
+    }
 }
 
 /// Additional fields present when the hook fires inside a subagent.
