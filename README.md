@@ -11,9 +11,10 @@ agents.
 
 ## How it works
 
-Claude Code calls this hook before every tool invocation. The hook binary reads
-the tool name and input JSON from stdin, evaluates it against a rules JSON file
-(passed via `--rules <path>`), and returns one of three decisions:
+Claude Code calls this hook before every tool invocation. Run the hook with
+`--mode claude` or `--mode codex`. The hook binary reads the tool name and input
+JSON from stdin, evaluates it against a rules JSON file (passed via
+`--rules <path>`), and returns one of three decisions:
 
 - **allow** -- tool call proceeds without prompting
 - **deny** -- tool call is blocked with an explanation
@@ -207,8 +208,9 @@ cwd should pass the writable check even if no flag points at it.
 
 ## Source files
 
-- `main.rs` -- CLI entry point. Reads `--rules <file>` and stdin JSON,
-  dispatches by tool name, resolves path-conditional decisions.
+- `main.rs` -- CLI entry point. Reads `--mode <claude|codex>`, `--rules <file>`,
+  and stdin JSON. It dispatches by tool name and resolves path-conditional
+  decisions.
 - `bash.rs` -- Bash command parsing using tree-sitter-bash.
 - `evaluate.rs` -- Core decision tree evaluation logic.
 - `decision.rs` -- Decision types, conditions, and merging (deny > ask > allow).
@@ -563,8 +565,8 @@ it sends nearly the same stdin schema, so no separate build is needed. Tool
 dispatch is keyed on the `tool_name` field in the payload, not on which agent
 invoked the hook.
 
-The hook detects a Codex caller automatically via the Codex-only `turn_id`
-field, so no flag or extra configuration is required.
+The caller must select the Codex response protocol with `--mode codex` since the
+default is to assume Claude.
 
 [2]: https://developers.openai.com/codex/hooks
 
@@ -585,7 +587,8 @@ matcher = ".*"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "/path/to/claude-pretool-hook-wrapped"   # wrapper that adds --rules
+command = "/path/to/claude-pretool-hook-codex-wrapped"
+# The wrapper adds --mode codex and --rules.
 ```
 
 **Trust step:** on first use -- and again whenever the command's path changes
@@ -603,7 +606,7 @@ let
     hooks = [
       {
         type = "command";
-        command = config.programs.claude-pretool-hook.wrappedCommand;
+        command = config.programs.claude-pretool-hook.codexWrappedCommand;
         timeout = 600;
         async = false;
       }

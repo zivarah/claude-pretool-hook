@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use decision::{merge, Decision, EvalResult, PathCheck};
 use input::{BashInput, HookInput, ToolInput};
 use rules::Rules;
@@ -31,9 +31,20 @@ use crate::{
 #[derive(Parser)]
 #[command(name = "claude-pretool-hook")]
 struct Cli {
+    /// Hook protocol to use for the response
+    #[arg(long, value_enum, default_value_t = Mode::Claude)]
+    mode: Mode,
+
     /// Path to the rules JSON file
     #[arg(long)]
     rules: String,
+}
+
+/// Hook protocol used by the process that invokes this command.
+#[derive(Clone, Copy, ValueEnum)]
+enum Mode {
+    Claude,
+    Codex,
 }
 
 fn main() {
@@ -55,17 +66,16 @@ fn main() {
         }
     };
 
-    // Read hook input from stdin.  How the decision is serialized depends on
-    // the caller, which is only known once the payload parses, so the output
-    // context is filled in after parsing and left at its default otherwise.
     let mut input = String::new();
-    let mut output_ctx = OutputContext::default();
+    let mut output_ctx = OutputContext {
+        mode: cli.mode,
+        defer_ask: false,
+    };
     let response = if let Err(e) = std::io::stdin().read_to_string(&mut input) {
         create_response(Decision::Ask, &format!("failed to read stdin: {e}"))
     } else {
         match serde_json::from_str::<HookInput>(&input) {
             Ok(hook_input) => {
-                output_ctx.is_codex = hook_input.common.is_codex();
                 output_ctx.defer_ask =
                     rules.defer_ask_in_auto_mode && hook_input.common.is_auto_mode();
                 let cwd = PathBuf::from(&hook_input.common.cwd);
@@ -91,12 +101,9 @@ fn main() {
     print_response(&response, &output_ctx);
 }
 
-/// Caller-derived context that shapes how a decision is serialized.  Defaults
-/// to the plain Claude Code behavior, which is also the safe fallback when the
-/// payload cannot be parsed.
-#[derive(Default)]
+/// Context that controls how the hook serializes a decision.
 struct OutputContext {
-    is_codex: bool,
+    mode: Mode,
     /// Claude Code is in "auto" permission mode and the rules opted into
     /// deferring to it via `deferAskInAutoMode`.
     defer_ask: bool,
@@ -108,8 +115,8 @@ impl OutputContext {
     fn abstains_from(&self, decision: Decision) -> bool {
         match decision {
             Decision::Deny => false,
-            Decision::Allow => self.is_codex,
-            Decision::Ask => self.is_codex || self.defer_ask,
+            Decision::Allow => matches!(self.mode, Mode::Codex),
+            Decision::Ask => matches!(self.mode, Mode::Codex) || self.defer_ask,
         }
     }
 }
@@ -132,7 +139,7 @@ pub struct HookOutput {
     pub hook_specific_output: HookSpecificOutput,
 }
 
-/// Serialize the response for the detected caller.
+/// Serialize the response for the selected hook protocol.
 ///
 /// Both Claude Code and Codex accept the `hookSpecificOutput` form with
 /// `permissionDecision: "deny"`, so denials serialize identically. Codex's

@@ -39,8 +39,12 @@ let
 
   generatedRulesFile = pkgs.writeText "claude-pretool-hook-rules.json" (builtins.toJSON cleanedRules);
 
-  wrappedScript = pkgs.writeShellScriptBin "claude-pretool-hook-wrapped" ''
-    exec ${lib.getExe cfg.package} --rules ${cfg.rulesFile}
+  claudeWrappedScript = pkgs.writeShellScriptBin "claude-pretool-hook-wrapped" ''
+    exec ${lib.getExe cfg.package} --mode claude --rules ${cfg.rulesFile}
+  '';
+
+  codexWrappedScript = pkgs.writeShellScriptBin "claude-pretool-hook-codex-wrapped" ''
+    exec ${lib.getExe cfg.package} --mode codex --rules ${cfg.rulesFile}
   '';
 in
 {
@@ -69,7 +73,7 @@ in
       description = ''
         When true, append a PreToolUse entry to
         `programs.claude-code.settings.hooks.PreToolUse` that runs the wrapper
-        script (which exec's the hook binary with `--rules <rulesFile>`).
+        script (which runs the hook in Claude mode with `rulesFile`).
         Defaults to true when `rules` has any populated field, false otherwise.
         Set to false if you want to customize how the hook is configured.
 
@@ -106,8 +110,18 @@ in
       readOnly = true;
       description = ''
         Path to a wrapper script that exec's the hook binary with
-        `--rules` pointing at `rulesFile`. Suitable for use as the
+        `--mode claude` and `--rules` pointing at `rulesFile`. Use this as the
         `command` field of a Claude Code hook entry.
+      '';
+    };
+
+    codexWrappedCommand = lib.mkOption {
+      type = lib.types.str;
+      readOnly = true;
+      description = ''
+        Path to a wrapper script that exec's the hook binary with
+        `--mode codex` and `--rules` pointing at `rulesFile`. Use this as the
+        `command` field of an OpenAI Codex hook entry.
       '';
     };
   };
@@ -117,7 +131,8 @@ in
       {
         programs.claude-pretool-hook = {
           command = lib.getExe cfg.package;
-          wrappedCommand = lib.getExe wrappedScript;
+          wrappedCommand = lib.getExe claudeWrappedScript;
+          codexWrappedCommand = lib.getExe codexWrappedScript;
         };
       }
       (lib.mkIf cfg.configureHook {
@@ -127,7 +142,7 @@ in
             hooks = [
               {
                 type = "command";
-                command = lib.getExe wrappedScript;
+                command = lib.getExe claudeWrappedScript;
               }
             ];
           }
@@ -142,7 +157,7 @@ in
               hooks = [
                 {
                   type = "command";
-                  command = lib.getExe wrappedScript;
+                  command = lib.getExe codexWrappedScript;
                 }
               ];
             }

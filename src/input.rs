@@ -17,19 +17,9 @@ pub struct CommonInput {
     pub permission_mode: Option<String>,
     pub hook_event_name: String,
     pub tool_use_id: Option<String>,
-    /// Codex extension identifying the active turn.  Claude Code never sends
-    /// it, so its presence is used to detect a Codex caller and select the
-    /// output format Codex acts on.
-    pub turn_id: Option<String>,
 }
 
 impl CommonInput {
-    /// Whether the payload originated from OpenAI Codex rather than Claude
-    /// Code, detected via the Codex-only `turn_id` field.
-    pub fn is_codex(&self) -> bool {
-        self.turn_id.is_some()
-    }
-
     /// Whether Claude Code is in "auto" permission mode, where Claude judges
     /// for itself any tool call the permission rules leave unresolved.
     pub fn is_auto_mode(&self) -> bool {
@@ -258,7 +248,6 @@ impl<'de> Deserialize<'de> for HookInput {
             #[serde(default)]
             hook_event_name: String,
             tool_use_id: Option<String>,
-            turn_id: Option<String>,
             agent_id: Option<String>,
             agent_type: Option<String>,
             #[serde(default)]
@@ -276,7 +265,6 @@ impl<'de> Deserialize<'de> for HookInput {
             permission_mode: flat.permission_mode,
             hook_event_name: flat.hook_event_name,
             tool_use_id: flat.tool_use_id,
-            turn_id: flat.turn_id,
         };
 
         let agent = if flat.agent_id.is_some() || flat.agent_type.is_some() {

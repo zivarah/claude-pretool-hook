@@ -8,13 +8,23 @@ const DEFER_ASK_RULES: &str = "tests/fixtures/defer_ask_rules.json";
 
 /// Run the hook binary with the given JSON on stdin, returning raw stdout.
 fn run_hook_raw(input_json: &str) -> (i32, String) {
-    run_hook_raw_with_rules(TEST_RULES, input_json)
+    run_hook_raw_with_mode("claude", input_json)
+}
+
+/// Run the hook in the selected mode with the default rules file.
+fn run_hook_raw_with_mode(mode: &str, input_json: &str) -> (i32, String) {
+    run_hook_raw_with_rules_and_mode(TEST_RULES, mode, input_json)
 }
 
 /// Run the hook binary against a specific rules file.
 fn run_hook_raw_with_rules(rules: &str, input_json: &str) -> (i32, String) {
+    run_hook_raw_with_rules_and_mode(rules, "claude", input_json)
+}
+
+/// Run the hook in the selected mode against a specific rules file.
+fn run_hook_raw_with_rules_and_mode(rules: &str, mode: &str, input_json: &str) -> (i32, String) {
     let bin = env!("CARGO_BIN_EXE_claude-pretool-hook");
-    let output = cmd!(bin, "--rules", rules)
+    let output = cmd!(bin, "--mode", mode, "--rules", rules)
         .stdin_bytes(input_json.as_bytes())
         .stdout_capture()
         .stderr_capture()
@@ -84,8 +94,7 @@ fn bash_input_with_cwd(command: &str, cwd: &str) -> String {
     .to_string()
 }
 
-/// Shorthand for a Codex-style Bash invocation, including the Codex-only
-/// `model` / `turn_id` fields to prove they are tolerated (ignored).
+/// Shorthand for a Codex-style Bash invocation with extra Codex fields.
 fn codex_bash_input(command: &str) -> String {
     serde_json::json!({
         "tool_name": "Bash",
@@ -98,11 +107,7 @@ fn codex_bash_input(command: &str) -> String {
     .to_string()
 }
 
-/// Shorthand for an `apply_patch` invocation carrying a patch envelope. Omits
-/// `turn_id` so the response uses the full-fidelity Claude output format,
-/// letting engine tests distinguish allow/ask/deny (Codex collapses allow and
-/// ask to an abstain on the wire). The Codex output mapping is covered
-/// separately via `codex_apply_patch_input`.
+/// Shorthand for an `apply_patch` invocation carrying a patch envelope.
 fn apply_patch_input(patch: &str) -> String {
     serde_json::json!({
         "tool_name": "apply_patch",
@@ -111,13 +116,12 @@ fn apply_patch_input(patch: &str) -> String {
     .to_string()
 }
 
-/// Shorthand for a Codex `apply_patch` invocation (includes `turn_id`).
+/// Shorthand for a Codex `apply_patch` invocation.
 fn codex_apply_patch_input(patch: &str) -> String {
     serde_json::json!({
         "tool_name": "apply_patch",
         "tool_input": { "input": patch },
-        "hook_event_name": "PreToolUse",
-        "turn_id": "t-1"
+        "hook_event_name": "PreToolUse"
     })
     .to_string()
 }
@@ -1400,7 +1404,7 @@ fn missing_tool_name_ask() {
 #[test]
 fn missing_rules_file_exits_1() {
     let bin = env!("CARGO_BIN_EXE_claude-pretool-hook");
-    let output = cmd!(bin, "--rules", "nonexistent.json")
+    let output = cmd!(bin, "--mode", "claude", "--rules", "nonexistent.json")
         .stdin_bytes(&b""[..])
         .stdout_capture()
         .stderr_capture()
@@ -1411,9 +1415,9 @@ fn missing_rules_file_exits_1() {
 }
 
 #[test]
-fn no_rules_arg_exits_1() {
+fn no_rules_arg_exits_2() {
     let bin = env!("CARGO_BIN_EXE_claude-pretool-hook");
-    let output = cmd!(bin)
+    let output = cmd!(bin, "--mode", "claude")
         .stdin_bytes(&b""[..])
         .stdout_capture()
         .stderr_capture()
@@ -1689,9 +1693,13 @@ fn bash_mktemp_tmpdir_long_eq_writable() {
 
 #[test]
 fn codex_bash_deny_with_extra_fields() {
-    // The Codex-only `model` / `turn_id` fields must be ignored; a denied Bash
-    // command still resolves to deny.
-    assert_decision(&codex_bash_input("dd"), "deny");
+    let (code, stdout) = run_hook_raw_with_mode("codex", &codex_bash_input("dd"));
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        parsed["hookSpecificOutput"]["permissionDecision"], "deny",
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -1738,12 +1746,12 @@ fn codex_apply_patch_unparseable_asks() {
 }
 
 #[test]
-fn codex_allow_abstains() {
+fn codex_mode_allow_without_codex_fields_abstains() {
     // Codex has no hook-returnable plain "allow" (it rejects `decision:
     // "approve"` and requires an `updatedInput` rewrite for
     // `permissionDecision: "allow"`), so an allow must abstain with an empty
     // object.
-    let (_, stdout) = run_hook_raw(&codex_bash_input("ls"));
+    let (_, stdout) = run_hook_raw_with_mode("codex", &bash_input("ls"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(
         parsed.get("decision").is_none(),
@@ -1759,7 +1767,7 @@ fn codex_allow_abstains() {
 fn codex_deny_emits_hook_specific_output() {
     // Deny uses the same hookSpecificOutput form Claude uses, which Codex also
     // accepts, with a non-empty reason.
-    let (_, stdout) = run_hook_raw(&codex_bash_input("dd"));
+    let (_, stdout) = run_hook_raw_with_mode("codex", &codex_bash_input("dd"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         parsed["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -1778,7 +1786,7 @@ fn codex_deny_emits_hook_specific_output() {
 fn codex_ask_abstains() {
     // "ask" has no Codex representation; abstain so Codex uses its normal
     // approval flow.
-    let (_, stdout) = run_hook_raw(&codex_bash_input("sh"));
+    let (_, stdout) = run_hook_raw_with_mode("codex", &codex_bash_input("sh"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(
         parsed.get("decision").is_none(),
@@ -1796,7 +1804,7 @@ fn codex_apply_patch_deny_blocks() {
     // surfaces as a real hookSpecificOutput deny.
     let patch =
         "*** Begin Patch\n*** Update File: /home/user/api.secret\n@@\n-a\n+b\n*** End Patch";
-    let (_, stdout) = run_hook_raw(&codex_apply_patch_input(patch));
+    let (_, stdout) = run_hook_raw_with_mode("codex", &codex_apply_patch_input(patch));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         parsed["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -1806,9 +1814,9 @@ fn codex_apply_patch_deny_blocks() {
 
 #[test]
 fn claude_output_format_unchanged() {
-    // A Claude payload (no turn_id) must still use hookSpecificOutput, and an
-    // allow stays a full permissionDecision (not an abstain).
-    let (_, stdout) = run_hook_raw(&bash_input("ls"));
+    // The explicit Claude mode controls the output even when the payload has
+    // fields that Codex sends.
+    let (_, stdout) = run_hook_raw_with_mode("claude", &codex_bash_input("ls"));
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         parsed["hookSpecificOutput"]["permissionDecision"], "allow",
